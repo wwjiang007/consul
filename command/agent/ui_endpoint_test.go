@@ -15,15 +15,13 @@ import (
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/consul/testrpc"
+	"github.com/hashicorp/consul/testutil"
 	"github.com/hashicorp/go-cleanhttp"
 )
 
 func TestUiIndex(t *testing.T) {
 	// Make a test dir to serve UI files
-	uiDir, err := ioutil.TempDir("", "consul")
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	uiDir := testutil.TempDir(t, "consul")
 	defer os.RemoveAll(uiDir)
 
 	// Make the server
@@ -41,10 +39,7 @@ func TestUiIndex(t *testing.T) {
 	}
 
 	// Register node
-	req, err := http.NewRequest("GET", "/ui/my-file", nil)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	req, _ := http.NewRequest("GET", "/ui/my-file", nil)
 	req.URL.Scheme = "http"
 	req.URL.Host = srv.listener.Addr().String()
 
@@ -87,11 +82,7 @@ func TestUiNodes(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
-	req, err := http.NewRequest("GET", "/v1/internal/ui/nodes/dc1", nil)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
+	req, _ := http.NewRequest("GET", "/v1/internal/ui/nodes/dc1", nil)
 	resp := httptest.NewRecorder()
 	obj, err := srv.UINodes(resp, req)
 	if err != nil {
@@ -120,12 +111,7 @@ func TestUiNodeInfo(t *testing.T) {
 
 	testrpc.WaitForLeader(t, srv.agent.RPC, "dc1")
 
-	req, err := http.NewRequest("GET",
-		fmt.Sprintf("/v1/internal/ui/node/%s", srv.agent.config.NodeName), nil)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
+	req, _ := http.NewRequest("GET", fmt.Sprintf("/v1/internal/ui/node/%s", srv.agent.config.NodeName), nil)
 	resp := httptest.NewRecorder()
 	obj, err := srv.UINodeInfo(resp, req)
 	if err != nil {
@@ -151,11 +137,7 @@ func TestUiNodeInfo(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
-	req, err = http.NewRequest("GET", "/v1/internal/ui/node/test", nil)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
+	req, _ = http.NewRequest("GET", "/v1/internal/ui/node/test", nil)
 	resp = httptest.NewRecorder()
 	obj, err = srv.UINodeInfo(resp, req)
 	if err != nil {

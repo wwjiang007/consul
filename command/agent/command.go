@@ -1,18 +1,13 @@
 package agent
 
 import (
-	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -20,12 +15,6 @@ import (
 	"github.com/armon/go-metrics"
 	"github.com/armon/go-metrics/circonus"
 	"github.com/armon/go-metrics/datadog"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/defaults"
-	"github.com/aws/aws-sdk-go/aws/ec2metadata"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/hashicorp/consul/command/base"
 	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/consul/lib"
@@ -34,11 +23,7 @@ import (
 	"github.com/hashicorp/go-checkpoint"
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/logutils"
-	"github.com/hashicorp/scada-client/scada"
 	"github.com/mitchellh/cli"
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
-	compute "google.golang.org/api/compute/v1"
 )
 
 // gracefulTimeout controls how long we wait before forcefully terminating
@@ -65,8 +50,6 @@ type Command struct {
 	agent             *Agent
 	httpServers       []*HTTPServer
 	dnsServer         *DNSServer
-	scadaProvider     *scada.Provider
-	scadaHTTP         *HTTPServer
 }
 
 // readConfig is responsible for setup of our configuration using
@@ -78,7 +61,6 @@ func (c *Command) readConfig() *Config {
 	var retryIntervalWan string
 	var dnsRecursors []string
 	var dev bool
-	var dcDeprecated string
 	var nodeMeta []string
 
 	f := c.Command.NewFlagSet(c)
@@ -104,7 +86,6 @@ func (c *Command) readConfig() *Config {
 		"Setting this to true will prevent Consul from using information from the"+
 			" host to generate a node ID, and will cause Consul to generate a"+
 			" random node ID instead.")
-	f.StringVar(&dcDeprecated, "dc", "", "Datacenter of the agent (deprecated: use 'datacenter' instead).")
 	f.StringVar(&cmdConfig.Datacenter, "datacenter", "", "Datacenter of the agent.")
 	f.StringVar(&cmdConfig.DataDir, "data-dir", "", "Path to a data directory to store agent state.")
 	f.BoolVar(&cmdConfig.EnableUI, "ui", false, "Enables the built-in static web UI server.")
@@ -131,15 +112,6 @@ func (c *Command) readConfig() *Config {
 	f.StringVar(&cmdConfig.AdvertiseAddr, "advertise", "", "Sets the advertise address to use.")
 	f.StringVar(&cmdConfig.AdvertiseAddrWan, "advertise-wan", "",
 		"Sets address to advertise on WAN instead of -advertise address.")
-
-	f.StringVar(&cmdConfig.AtlasInfrastructure, "atlas", "",
-		"(deprecated) Sets the Atlas infrastructure name, enables SCADA.")
-	f.StringVar(&cmdConfig.AtlasToken, "atlas-token", "",
-		"(deprecated) Provides the Atlas API token.")
-	f.BoolVar(&cmdConfig.AtlasJoin, "atlas-join", false,
-		"(deprecated) Enables auto-joining the Atlas cluster.")
-	f.StringVar(&cmdConfig.AtlasEndpoint, "atlas-endpoint", "",
-		"(deprecated) The address of the endpoint for Atlas integration.")
 
 	f.IntVar(&cmdConfig.Protocol, "protocol", -1,
 		"Sets the protocol version. Defaults to latest.")
@@ -182,8 +154,41 @@ func (c *Command) readConfig() *Config {
 	f.StringVar(&retryIntervalWan, "retry-interval-wan", "",
 		"Time to wait between join -wan attempts.")
 
+	// deprecated flags
+	var dcDeprecated string
+	var atlasJoin bool
+	var atlasInfrastructure, atlasToken, atlasEndpoint string
+	f.StringVar(&dcDeprecated, "dc", "",
+		"(deprecated) Datacenter of the agent (use 'datacenter' instead).")
+	f.StringVar(&atlasInfrastructure, "atlas", "",
+		"(deprecated) Sets the Atlas infrastructure name, enables SCADA.")
+	f.StringVar(&atlasToken, "atlas-token", "",
+		"(deprecated) Provides the Atlas API token.")
+	f.BoolVar(&atlasJoin, "atlas-join", false,
+		"(deprecated) Enables auto-joining the Atlas cluster.")
+	f.StringVar(&atlasEndpoint, "atlas-endpoint", "",
+		"(deprecated) The address of the endpoint for Atlas integration.")
+
 	if err := c.Command.Parse(c.args); err != nil {
 		return nil
+	}
+
+	// check deprecated flags
+	if atlasInfrastructure != "" {
+		c.UI.Warn("WARNING: 'atlas' is deprecated")
+	}
+	if atlasToken != "" {
+		c.UI.Warn("WARNING: 'atlas-token' is deprecated")
+	}
+	if atlasJoin {
+		c.UI.Warn("WARNING: 'atlas-join' is deprecated")
+	}
+	if atlasEndpoint != "" {
+		c.UI.Warn("WARNING: 'atlas-endpoint' is deprecated")
+	}
+	if dcDeprecated != "" && cmdConfig.Datacenter == "" {
+		c.UI.Warn("WARNING: 'dc' is deprecated. Use 'datacenter' instead")
+		cmdConfig.Datacenter = dcDeprecated
 	}
 
 	if retryInterval != "" {
@@ -321,14 +326,6 @@ func (c *Command) readConfig() *Config {
 		}
 	}
 
-	// Output a warning if the 'dc' flag has been used.
-	if dcDeprecated != "" {
-		c.UI.Error("WARNING: the 'dc' flag has been deprecated. Use 'datacenter' instead")
-
-		// Making sure that we don't break previous versions.
-		config.Datacenter = dcDeprecated
-	}
-
 	// Ensure the datacenter is always lowercased. The DNS endpoints automatically
 	// lowercase all queries, and internally we expect DC1 and dc1 to be the same.
 	config.Datacenter = strings.ToLower(config.Datacenter)
@@ -371,6 +368,16 @@ func (c *Command) readConfig() *Config {
 	// Expect & Bootstrap are mutually exclusive
 	if config.BootstrapExpect != 0 && config.Bootstrap {
 		c.UI.Error("Bootstrap cannot be provided with an expected server count")
+		return nil
+	}
+
+	if isAddrANY(config.AdvertiseAddr) {
+		c.UI.Error("Advertise address cannot be " + config.AdvertiseAddr)
+		return nil
+	}
+
+	if isAddrANY(config.AdvertiseAddrWan) {
+		c.UI.Error("Advertise WAN address cannot be " + config.AdvertiseAddrWan)
 		return nil
 	}
 
@@ -442,255 +449,6 @@ func (c *Command) readConfig() *Config {
 	return config
 }
 
-// verifyUniqueListeners checks to see if an address was used more than once in
-// the config
-func (c *Config) verifyUniqueListeners() error {
-	listeners := []struct {
-		host  string
-		port  int
-		descr string
-	}{
-		{c.Addresses.DNS, c.Ports.DNS, "DNS"},
-		{c.Addresses.HTTP, c.Ports.HTTP, "HTTP"},
-		{c.Addresses.HTTPS, c.Ports.HTTPS, "HTTPS"},
-		{c.AdvertiseAddr, c.Ports.Server, "Server RPC"},
-		{c.AdvertiseAddr, c.Ports.SerfLan, "Serf LAN"},
-		{c.AdvertiseAddr, c.Ports.SerfWan, "Serf WAN"},
-	}
-
-	type key struct {
-		host string
-		port int
-	}
-	m := make(map[key]string, len(listeners))
-
-	for _, l := range listeners {
-		if l.host == "" {
-			l.host = "0.0.0.0"
-		} else if strings.HasPrefix(l.host, "unix") {
-			// Don't compare ports on unix sockets
-			l.port = 0
-		}
-		if l.host == "0.0.0.0" && l.port <= 0 {
-			continue
-		}
-
-		k := key{l.host, l.port}
-		v, ok := m[k]
-		if ok {
-			return fmt.Errorf("%s address already configured for %s", l.descr, v)
-		}
-		m[k] = l.descr
-	}
-	return nil
-}
-
-// discoverEc2Hosts searches an AWS region, returning a list of instance ips
-// where EC2TagKey = EC2TagValue
-func (c *Config) discoverEc2Hosts(logger *log.Logger) ([]string, error) {
-	config := c.RetryJoinEC2
-
-	ec2meta := ec2metadata.New(session.New())
-	if config.Region == "" {
-		logger.Printf("[INFO] agent: No EC2 region provided, querying instance metadata endpoint...")
-		identity, err := ec2meta.GetInstanceIdentityDocument()
-		if err != nil {
-			return nil, err
-		}
-		config.Region = identity.Region
-	}
-
-	awsConfig := &aws.Config{
-		Region: &config.Region,
-		Credentials: credentials.NewChainCredentials(
-			[]credentials.Provider{
-				&credentials.StaticProvider{
-					Value: credentials.Value{
-						AccessKeyID:     config.AccessKeyID,
-						SecretAccessKey: config.SecretAccessKey,
-					},
-				},
-				&credentials.EnvProvider{},
-				&credentials.SharedCredentialsProvider{},
-				defaults.RemoteCredProvider(*(defaults.Config()), defaults.Handlers()),
-			}),
-	}
-
-	svc := ec2.New(session.New(), awsConfig)
-
-	resp, err := svc.DescribeInstances(&ec2.DescribeInstancesInput{
-		Filters: []*ec2.Filter{
-			{
-				Name: aws.String("tag:" + config.TagKey),
-				Values: []*string{
-					aws.String(config.TagValue),
-				},
-			},
-		},
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	var servers []string
-	for i := range resp.Reservations {
-		for _, instance := range resp.Reservations[i].Instances {
-			// Terminated instances don't have the PrivateIpAddress field
-			if instance.PrivateIpAddress != nil {
-				servers = append(servers, *instance.PrivateIpAddress)
-			}
-		}
-	}
-
-	return servers, nil
-}
-
-// discoverGCEHosts searches a Google Compute Engine region, returning a list
-// of instance ips that match the tags given in GCETags.
-func (c *Config) discoverGCEHosts(logger *log.Logger) ([]string, error) {
-	config := c.RetryJoinGCE
-	ctx := oauth2.NoContext
-	var client *http.Client
-	var err error
-
-	logger.Printf("[INFO] agent: Initializing GCE client")
-	if config.CredentialsFile != "" {
-		logger.Printf("[INFO] agent: Loading credentials from %s", config.CredentialsFile)
-		key, err := ioutil.ReadFile(config.CredentialsFile)
-		if err != nil {
-			return nil, err
-		}
-		jwtConfig, err := google.JWTConfigFromJSON(key, compute.ComputeScope)
-		if err != nil {
-			return nil, err
-		}
-		client = jwtConfig.Client(ctx)
-	} else {
-		logger.Printf("[INFO] agent: Using default credential chain")
-		client, err = google.DefaultClient(ctx, compute.ComputeScope)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	computeService, err := compute.New(client)
-	if err != nil {
-		return nil, err
-	}
-
-	if config.ProjectName == "" {
-		logger.Printf("[INFO] agent: No GCE project provided, will discover from metadata.")
-		config.ProjectName, err = gceProjectIDFromMetadata(logger)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		logger.Printf("[INFO] agent: Using pre-defined GCE project name: %s", config.ProjectName)
-	}
-
-	zones, err := gceDiscoverZones(ctx, logger, computeService, config.ProjectName, config.ZonePattern)
-	if err != nil {
-		return nil, err
-	}
-
-	logger.Printf("[INFO] agent: Discovering GCE hosts with tag %s in zones: %s", config.TagValue, strings.Join(zones, ", "))
-
-	var servers []string
-	for _, zone := range zones {
-		addresses, err := gceInstancesAddressesForZone(ctx, logger, computeService, config.ProjectName, zone, config.TagValue)
-		if err != nil {
-			return nil, err
-		}
-		if len(addresses) > 0 {
-			logger.Printf("[INFO] agent: Discovered %d instances in %s/%s: %v", len(addresses), config.ProjectName, zone, addresses)
-		}
-		servers = append(servers, addresses...)
-	}
-
-	return servers, nil
-}
-
-// gceProjectIDFromMetadata queries the metadata service on GCE to get the
-// project ID (name) of an instance.
-func gceProjectIDFromMetadata(logger *log.Logger) (string, error) {
-	logger.Printf("[INFO] agent: Attempting to discover GCE project from metadata.")
-	client := &http.Client{}
-
-	req, err := http.NewRequest("GET", "http://metadata.google.internal/computeMetadata/v1/project/project-id", nil)
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Add("Metadata-Flavor", "Google")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-
-	defer resp.Body.Close()
-
-	project, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	logger.Printf("[INFO] agent: GCE project discovered as: %s", project)
-	return string(project), nil
-}
-
-// gceDiscoverZones discovers a list of zones from a supplied zone pattern, or
-// all of the zones available to a project.
-func gceDiscoverZones(ctx context.Context, logger *log.Logger, computeService *compute.Service, project, pattern string) ([]string, error) {
-	var zones []string
-
-	if pattern != "" {
-		logger.Printf("[INFO] agent: Discovering zones for project %s matching pattern: %s", project, pattern)
-	} else {
-		logger.Printf("[INFO] agent: Discovering all zones available to project: %s", project)
-	}
-
-	call := computeService.Zones.List(project)
-	if pattern != "" {
-		call = call.Filter(fmt.Sprintf("name eq %s", pattern))
-	}
-
-	if err := call.Pages(ctx, func(page *compute.ZoneList) error {
-		for _, v := range page.Items {
-			zones = append(zones, v.Name)
-		}
-		return nil
-	}); err != nil {
-		return zones, err
-	}
-
-	logger.Printf("[INFO] agent: Discovered GCE zones: %s", strings.Join(zones, ", "))
-	return zones, nil
-}
-
-// gceInstancesAddressesForZone locates all instances within a specific project
-// and zone, matching the supplied tag. Only the private IP addresses are
-// returned, but ID is also logged.
-func gceInstancesAddressesForZone(ctx context.Context, logger *log.Logger, computeService *compute.Service, project, zone, tag string) ([]string, error) {
-	var addresses []string
-	call := computeService.Instances.List(project, zone)
-	if err := call.Pages(ctx, func(page *compute.InstanceList) error {
-		for _, v := range page.Items {
-			for _, t := range v.Tags.Items {
-				if t == tag && len(v.NetworkInterfaces) > 0 && v.NetworkInterfaces[0].NetworkIP != "" {
-					addresses = append(addresses, v.NetworkInterfaces[0].NetworkIP)
-				}
-			}
-		}
-		return nil
-	}); err != nil {
-		return addresses, err
-	}
-
-	return addresses, nil
-}
-
 // setupAgent is used to start the agent and various interfaces
 func (c *Command) setupAgent(config *Config, logOutput io.Writer, logWriter *logger.LogWriter) error {
 	c.UI.Output("Starting Consul agent...")
@@ -700,13 +458,6 @@ func (c *Command) setupAgent(config *Config, logOutput io.Writer, logWriter *log
 		return err
 	}
 	c.agent = agent
-
-	// Enable the SCADA integration
-	if err := c.setupScadaConn(config); err != nil {
-		agent.Shutdown()
-		c.UI.Error(fmt.Sprintf("Error starting SCADA connection: %s", err))
-		return err
-	}
 
 	if config.Ports.HTTP > 0 || config.Ports.HTTPS > 0 {
 		servers, err := NewHTTPServers(agent, config, logOutput)
@@ -1051,16 +802,6 @@ func (c *Command) Run(args []string) int {
 		defer server.Shutdown()
 	}
 
-	// Check and shut down the SCADA listeners at the end
-	defer func() {
-		if c.scadaHTTP != nil {
-			c.scadaHTTP.Shutdown()
-		}
-		if c.scadaProvider != nil {
-			c.scadaProvider.Shutdown()
-		}
-	}()
-
 	// Join startup nodes if specified
 	if err := c.startupJoin(config); err != nil {
 		c.UI.Error(err.Error())
@@ -1112,12 +853,6 @@ func (c *Command) Run(args []string) int {
 		gossipEncrypted = c.agent.client.Encrypted()
 	}
 
-	// Determine the Atlas cluster
-	atlas := "<disabled>"
-	if config.AtlasInfrastructure != "" {
-		atlas = fmt.Sprintf("(Infrastructure: '%s' Join: %v)", config.AtlasInfrastructure, config.AtlasJoin)
-	}
-
 	// Let the agent know we've finished registration
 	c.agent.StartSync()
 
@@ -1133,7 +868,6 @@ func (c *Command) Run(args []string) int {
 		config.Ports.SerfLan, config.Ports.SerfWan))
 	c.UI.Info(fmt.Sprintf("Gossip encrypt: %v, RPC-TLS: %v, TLS-Incoming: %v",
 		gossipEncrypted, config.VerifyOutgoing, config.VerifyIncoming))
-	c.UI.Info(fmt.Sprintf("         Atlas: %s", atlas))
 
 	// Enable log streaming
 	c.UI.Info("")
@@ -1316,64 +1050,7 @@ func (c *Command) handleReload(config *Config) (*Config, error) {
 		}(wp)
 	}
 
-	// Reload SCADA client if we have a change
-	if newConf.AtlasInfrastructure != config.AtlasInfrastructure ||
-		newConf.AtlasToken != config.AtlasToken ||
-		newConf.AtlasEndpoint != config.AtlasEndpoint {
-		if err := c.setupScadaConn(newConf); err != nil {
-			errs = multierror.Append(errs, fmt.Errorf("Failed reloading SCADA client: %s", err))
-			return nil, errs
-		}
-	}
-
 	return newConf, errs
-}
-
-// startScadaClient is used to start a new SCADA provider and listener,
-// replacing any existing listeners.
-func (c *Command) setupScadaConn(config *Config) error {
-	// Shut down existing SCADA listeners
-	if c.scadaProvider != nil {
-		c.scadaProvider.Shutdown()
-	}
-	if c.scadaHTTP != nil {
-		c.scadaHTTP.Shutdown()
-	}
-
-	// No-op if we don't have an infrastructure
-	if config.AtlasInfrastructure == "" {
-		return nil
-	}
-
-	c.UI.Error("WARNING: The hosted version of Consul Enterprise will be deprecated " +
-		"on March 7th, 2017. For details, see " +
-		"https://atlas.hashicorp.com/help/consul/alternatives")
-
-	scadaConfig := &scada.Config{
-		Service:      "consul",
-		Version:      fmt.Sprintf("%s%s", config.Version, config.VersionPrerelease),
-		ResourceType: "infrastructures",
-		Meta: map[string]string{
-			"auto-join":  strconv.FormatBool(config.AtlasJoin),
-			"datacenter": config.Datacenter,
-			"server":     strconv.FormatBool(config.Server),
-		},
-		Atlas: scada.AtlasConfig{
-			Endpoint:       config.AtlasEndpoint,
-			Infrastructure: config.AtlasInfrastructure,
-			Token:          config.AtlasToken,
-		},
-	}
-
-	// Create the new provider and listener
-	c.UI.Output("Connecting to Atlas: " + config.AtlasInfrastructure)
-	provider, list, err := scada.NewHTTPProvider(scadaConfig, c.logOutput)
-	if err != nil {
-		return err
-	}
-	c.scadaProvider = provider
-	c.scadaHTTP = newScadaHTTP(c.agent, list)
-	return nil
 }
 
 func (c *Command) Synopsis() string {

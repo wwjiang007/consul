@@ -3,7 +3,6 @@ package agent
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
@@ -12,6 +11,7 @@ import (
 	rawacl "github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/consul/testrpc"
+	"github.com/hashicorp/consul/testutil"
 	"github.com/hashicorp/consul/types"
 	"github.com/hashicorp/serf/serf"
 )
@@ -21,10 +21,7 @@ func TestACL_Bad_Config(t *testing.T) {
 	config.ACLDownPolicy = "nope"
 
 	var err error
-	config.DataDir, err = ioutil.TempDir("", "agent")
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	config.DataDir = testutil.TempDir(t, "agent")
 	defer os.RemoveAll(config.DataDir)
 
 	_, err = Create(config, nil, nil, nil)
@@ -537,7 +534,7 @@ func TestACL_vetServiceRegister(t *testing.T) {
 		ID:      "my-service",
 		Service: "service",
 	})
-	if err == nil || !strings.Contains(err.Error(), permissionDenied) {
+	if !isPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -551,7 +548,7 @@ func TestACL_vetServiceRegister(t *testing.T) {
 		ID:      "my-service",
 		Service: "service",
 	})
-	if err == nil || !strings.Contains(err.Error(), permissionDenied) {
+	if !isPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
 	}
 }
@@ -589,7 +586,7 @@ func TestACL_vetServiceUpdate(t *testing.T) {
 
 	// Update without write privs.
 	err = agent.vetServiceUpdate("service-ro", "my-service")
-	if err == nil || !strings.Contains(err.Error(), permissionDenied) {
+	if !isPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
 	}
 }
@@ -625,7 +622,7 @@ func TestACL_vetCheckRegister(t *testing.T) {
 		ServiceID:   "my-service",
 		ServiceName: "service",
 	})
-	if err == nil || !strings.Contains(err.Error(), permissionDenied) {
+	if !isPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -641,7 +638,7 @@ func TestACL_vetCheckRegister(t *testing.T) {
 	err = agent.vetCheckRegister("node-ro", &structs.HealthCheck{
 		CheckID: types.CheckID("my-check"),
 	})
-	if err == nil || !strings.Contains(err.Error(), permissionDenied) {
+	if !isPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -661,7 +658,7 @@ func TestACL_vetCheckRegister(t *testing.T) {
 		ServiceID:   "my-service",
 		ServiceName: "service",
 	})
-	if err == nil || !strings.Contains(err.Error(), permissionDenied) {
+	if !isPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -674,7 +671,7 @@ func TestACL_vetCheckRegister(t *testing.T) {
 		ServiceID:   "my-service",
 		ServiceName: "service",
 	})
-	if err == nil || !strings.Contains(err.Error(), permissionDenied) {
+	if !isPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
 	}
 }
@@ -717,7 +714,7 @@ func TestACL_vetCheckUpdate(t *testing.T) {
 
 	// Update service check without write privs.
 	err = agent.vetCheckUpdate("service-ro", "my-service-check")
-	if err == nil || !strings.Contains(err.Error(), permissionDenied) {
+	if !isPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -732,7 +729,7 @@ func TestACL_vetCheckUpdate(t *testing.T) {
 
 	// Update without write privs.
 	err = agent.vetCheckUpdate("node-ro", "my-node-check")
-	if err == nil || !strings.Contains(err.Error(), permissionDenied) {
+	if !isPermissionDenied(err) {
 		t.Fatalf("err: %v", err)
 	}
 }

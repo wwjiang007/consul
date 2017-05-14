@@ -17,6 +17,7 @@ import (
 
 const (
 	DefaultDC          = "dc1"
+	DefaultRPCPort     = 8300
 	DefaultLANSerfPort = 8301
 	DefaultWANSerfPort = 8302
 
@@ -31,13 +32,13 @@ const (
 )
 
 var (
-	DefaultRPCAddr = &net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: 8300}
-)
+	DefaultRPCAddr = &net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: DefaultRPCPort}
 
-// ProtocolVersionMap is the mapping of Consul protocol versions
-// to Serf protocol versions. We mask the Serf protocols using
-// our own protocol version.
-var protocolVersionMap map[uint8]uint8
+	// ProtocolVersionMap is the mapping of Consul protocol versions
+	// to Serf protocol versions. We mask the Serf protocols using
+	// our own protocol version.
+	protocolVersionMap map[uint8]uint8
+)
 
 func init() {
 	protocolVersionMap = map[uint8]uint8{
@@ -94,6 +95,9 @@ type Config struct {
 	// reachable
 	RPCAdvertise *net.TCPAddr
 
+	// RPCSrcAddr is the source address for outgoing RPC connections.
+	RPCSrcAddr *net.TCPAddr
+
 	// SerfLANConfig is the configuration for the intra-dc serf
 	SerfLANConfig *serf.Config
 
@@ -124,11 +128,14 @@ type Config struct {
 	// must match a provided certificate authority. This can be used to force client auth.
 	VerifyIncoming bool
 
-	// VerifyOutgoing is used to verify the authenticity of outgoing connections.
+	// VerifyOutgoing is used to force verification of the authenticity of outgoing connections.
 	// This means that TLS requests are used, and TCP requests are not made. TLS connections
-	// must match a provided certificate authority. This is used to verify authenticity of
-	// server nodes.
+	// must match a provided certificate authority.
 	VerifyOutgoing bool
+
+	// UseTLS is used to enable TLS for outgoing connections to other TLS-capable Consul
+	// servers. This doesn't imply any verification, it only enables TLS if possible.
+	UseTLS bool
 
 	// VerifyServerHostname is used to enable hostname verification of servers. This
 	// ensures that the certificate presented is valid for server.<datacenter>.<domain>.
@@ -307,19 +314,18 @@ type Config struct {
 	AutopilotInterval time.Duration
 }
 
-// CheckVersion is used to check if the ProtocolVersion is valid
-func (c *Config) CheckVersion() error {
+// CheckProtocolVersion validates the protocol version.
+func (c *Config) CheckProtocolVersion() error {
 	if c.ProtocolVersion < ProtocolVersionMin {
-		return fmt.Errorf("Protocol version '%d' too low. Must be in range: [%d, %d]",
-			c.ProtocolVersion, ProtocolVersionMin, ProtocolVersionMax)
-	} else if c.ProtocolVersion > ProtocolVersionMax {
-		return fmt.Errorf("Protocol version '%d' too high. Must be in range: [%d, %d]",
-			c.ProtocolVersion, ProtocolVersionMin, ProtocolVersionMax)
+		return fmt.Errorf("Protocol version '%d' too low. Must be in range: [%d, %d]", c.ProtocolVersion, ProtocolVersionMin, ProtocolVersionMax)
+	}
+	if c.ProtocolVersion > ProtocolVersionMax {
+		return fmt.Errorf("Protocol version '%d' too high. Must be in range: [%d, %d]", c.ProtocolVersion, ProtocolVersionMin, ProtocolVersionMax)
 	}
 	return nil
 }
 
-// CheckACL is used to sanity check the ACL configuration
+// CheckACL validates the ACL configuration.
 func (c *Config) CheckACL() error {
 	switch c.ACLDefaultPolicy {
 	case "allow":
@@ -337,7 +343,7 @@ func (c *Config) CheckACL() error {
 	return nil
 }
 
-// DefaultConfig is used to return a sane default configuration
+// DefaultConfig returns a sane default configuration.
 func DefaultConfig() *Config {
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -435,6 +441,7 @@ func (c *Config) tlsConfig() *tlsutil.Config {
 		VerifyIncoming:           c.VerifyIncoming,
 		VerifyOutgoing:           c.VerifyOutgoing,
 		VerifyServerHostname:     c.VerifyServerHostname,
+		UseTLS:                   c.UseTLS,
 		CAFile:                   c.CAFile,
 		CAPath:                   c.CAPath,
 		CertFile:                 c.CertFile,
@@ -453,9 +460,9 @@ func (c *Config) tlsConfig() *tlsutil.Config {
 func (c *Config) GetTokenForAgent() string {
 	if c.ACLAgentToken != "" {
 		return c.ACLAgentToken
-	} else if c.ACLToken != "" {
-		return c.ACLToken
-	} else {
-		return ""
 	}
+	if c.ACLToken != "" {
+		return c.ACLToken
+	}
+	return ""
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/testutil"
 )
 
 func TestConfigEncryptBytes(t *testing.T) {
@@ -1022,7 +1023,7 @@ func TestDecodeConfig(t *testing.T) {
 		t.Fatalf("bad: %#v", config)
 	}
 
-	// Atlas configs
+	// Check deprecations
 	input = `{
 		"atlas_infrastructure": "hashicorp/prod",
 		"atlas_token": "abcdefg",
@@ -1030,25 +1031,9 @@ func TestDecodeConfig(t *testing.T) {
 		"atlas_join": true,
 		"atlas_endpoint": "foo.bar:1111"
 }`
-	config, err = DecodeConfig(bytes.NewReader([]byte(input)))
+	_, err = DecodeConfig(bytes.NewReader([]byte(input)))
 	if err != nil {
 		t.Fatalf("err: %s", err)
-	}
-
-	if config.AtlasInfrastructure != "hashicorp/prod" {
-		t.Fatalf("bad: %#v", config)
-	}
-	if config.AtlasToken != "abcdefg" {
-		t.Fatalf("bad: %#v", config)
-	}
-	if config.AtlasACLToken != "123456789" {
-		t.Fatalf("bad: %#v", config)
-	}
-	if !config.AtlasJoin {
-		t.Fatalf("bad: %#v", config)
-	}
-	if config.AtlasEndpoint != "foo.bar:1111" {
-		t.Fatalf("bad: %#v", config)
 	}
 
 	// Coordinate disable
@@ -1779,10 +1764,6 @@ func TestMergeConfig(t *testing.T) {
 				Perms: "0700",
 			},
 		},
-		AtlasInfrastructure: "hashicorp/prod",
-		AtlasToken:          "123456789",
-		AtlasACLToken:       "abcdefgh",
-		AtlasJoin:           true,
 		RetryJoinEC2: RetryJoinEC2{
 			Region:          "us-east-2",
 			TagKey:          "Key2",
@@ -1817,10 +1798,7 @@ func TestReadConfigPaths_badPath(t *testing.T) {
 }
 
 func TestReadConfigPaths_file(t *testing.T) {
-	tf, err := ioutil.TempFile("", "consul")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
+	tf := testutil.TempFile(t, "consul")
 	tf.Write([]byte(`{"node_name":"bar"}`))
 	tf.Close()
 	defer os.Remove(tf.Name())
@@ -1836,13 +1814,10 @@ func TestReadConfigPaths_file(t *testing.T) {
 }
 
 func TestReadConfigPaths_dir(t *testing.T) {
-	td, err := ioutil.TempDir("", "consul")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
+	td := testutil.TempDir(t, "consul")
 	defer os.RemoveAll(td)
 
-	err = ioutil.WriteFile(filepath.Join(td, "a.json"),
+	err := ioutil.WriteFile(filepath.Join(td, "a.json"),
 		[]byte(`{"node_name": "bar"}`), 0644)
 	if err != nil {
 		t.Fatalf("err: %s", err)

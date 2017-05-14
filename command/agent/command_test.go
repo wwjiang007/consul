@@ -2,9 +2,9 @@ package agent
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/consul/command/base"
 	"github.com/hashicorp/consul/testutil"
+	"github.com/hashicorp/consul/testutil/retry"
 	"github.com/hashicorp/consul/version"
 	"github.com/mitchellh/cli"
 )
@@ -50,16 +51,59 @@ func TestValidDatacenter(t *testing.T) {
 	}
 }
 
+// TestConfigFail should test command line flags that lead to an immediate error.
+func TestConfigFail(t *testing.T) {
+	tests := []struct {
+		args []string
+		out  string
+	}{
+		{
+			args: []string{"agent", "-server", "-data-dir", "foo", "-advertise", "0.0.0.0"},
+			out:  "==> Advertise address cannot be 0.0.0.0\n",
+		},
+		{
+			args: []string{"agent", "-server", "-data-dir", "foo", "-advertise", "::"},
+			out:  "==> Advertise address cannot be ::\n",
+		},
+		{
+			args: []string{"agent", "-server", "-data-dir", "foo", "-advertise", "[::]"},
+			out:  "==> Advertise address cannot be [::]\n",
+		},
+		{
+			args: []string{"agent", "-server", "-data-dir", "foo", "-advertise-wan", "0.0.0.0"},
+			out:  "==> Advertise WAN address cannot be 0.0.0.0\n",
+		},
+		{
+			args: []string{"agent", "-server", "-data-dir", "foo", "-advertise-wan", "::"},
+			out:  "==> Advertise WAN address cannot be ::\n",
+		},
+		{
+			args: []string{"agent", "-server", "-data-dir", "foo", "-advertise-wan", "[::]"},
+			out:  "==> Advertise WAN address cannot be [::]\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
+			cmd := exec.Command("consul", tt.args...)
+			b, err := cmd.CombinedOutput()
+			if got, want := err, "exit status 1"; got == nil || got.Error() != want {
+				t.Fatalf("got err %q want %q", got, want)
+			}
+			if got, want := string(b), tt.out; got != want {
+				t.Fatalf("got %q want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestRetryJoin(t *testing.T) {
 	dir, agent := makeAgent(t, nextConfig())
 	defer os.RemoveAll(dir)
 	defer agent.Shutdown()
 
 	conf2 := nextConfig()
-	tmpDir, err := ioutil.TempDir("", "consul")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
+	tmpDir := testutil.TempDir(t, "consul")
 	defer os.RemoveAll(tmpDir)
 
 	doneCh := make(chan struct{})
@@ -88,6 +132,7 @@ func TestRetryJoin(t *testing.T) {
 
 	args := []string{
 		"-server",
+		"-bind", agent.config.BindAddr,
 		"-data-dir", tmpDir,
 		"-node", fmt.Sprintf(`"%s"`, conf2.NodeName),
 		"-advertise", agent.config.BindAddr,
@@ -103,27 +148,18 @@ func TestRetryJoin(t *testing.T) {
 		}
 		close(doneCh)
 	}()
-
-	if err := testutil.WaitForResult(func() (bool, error) {
-		mem := agent.LANMembers()
-		if len(mem) != 2 {
-			return false, fmt.Errorf("bad: %#v", mem)
+	retry.Run(t, func(r *retry.R) {
+		if got, want := len(agent.LANMembers()), 2; got != want {
+			r.Fatalf("got %d LAN members want %d", got, want)
 		}
-		mem = agent.WANMembers()
-		if len(mem) != 2 {
-			return false, fmt.Errorf("bad (wan): %#v", mem)
+		if got, want := len(agent.WANMembers()), 2; got != want {
+			r.Fatalf("got %d WAN members want %d", got, want)
 		}
-		return true, nil
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
 }
 
 func TestReadCliConfig(t *testing.T) {
-	tmpDir, err := ioutil.TempDir("", "consul")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
+	tmpDir := testutil.TempDir(t, "consul")
 	defer os.RemoveAll(tmpDir)
 
 	shutdownCh := make(chan struct{})
@@ -252,10 +288,7 @@ func TestReadCliConfig(t *testing.T) {
 
 func TestRetryJoinFail(t *testing.T) {
 	conf := nextConfig()
-	tmpDir, err := ioutil.TempDir("", "consul")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
+	tmpDir := testutil.TempDir(t, "consul")
 	defer os.RemoveAll(tmpDir)
 
 	shutdownCh := make(chan struct{})
@@ -269,6 +302,7 @@ func TestRetryJoinFail(t *testing.T) {
 	serfAddr := fmt.Sprintf("%s:%d", conf.BindAddr, conf.Ports.SerfLan)
 
 	args := []string{
+		"-bind", conf.BindAddr,
 		"-data-dir", tmpDir,
 		"-retry-join", serfAddr,
 		"-retry-max", "1",
@@ -282,10 +316,7 @@ func TestRetryJoinFail(t *testing.T) {
 
 func TestRetryJoinWanFail(t *testing.T) {
 	conf := nextConfig()
-	tmpDir, err := ioutil.TempDir("", "consul")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
+	tmpDir := testutil.TempDir(t, "consul")
 	defer os.RemoveAll(tmpDir)
 
 	shutdownCh := make(chan struct{})
@@ -300,6 +331,7 @@ func TestRetryJoinWanFail(t *testing.T) {
 
 	args := []string{
 		"-server",
+		"-bind", conf.BindAddr,
 		"-data-dir", tmpDir,
 		"-retry-join-wan", serfAddr,
 		"-retry-max-wan", "1",
@@ -368,69 +400,19 @@ func TestDiscoverGCEHosts(t *testing.T) {
 	}
 }
 
-func TestSetupScadaConn(t *testing.T) {
-	// Create a config and assign an infra name
-	conf1 := nextConfig()
-	conf1.AtlasInfrastructure = "hashicorp/test1"
-	conf1.AtlasToken = "abc"
-
-	dir, agent := makeAgent(t, conf1)
-	defer os.RemoveAll(dir)
-	defer agent.Shutdown()
-
-	cmd := &Command{
-		ShutdownCh: make(chan struct{}),
-		Command:    baseCommand(new(cli.MockUi)),
-		agent:      agent,
-	}
-
-	// First start creates the scada conn
-	if err := cmd.setupScadaConn(conf1); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	http1 := cmd.scadaHTTP
-	provider1 := cmd.scadaProvider
-
-	// Performing setup again tears down original and replaces
-	// with a new SCADA client.
-	conf2 := nextConfig()
-	conf2.AtlasInfrastructure = "hashicorp/test2"
-	conf2.AtlasToken = "123"
-	if err := cmd.setupScadaConn(conf2); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if cmd.scadaHTTP == http1 || cmd.scadaProvider == provider1 {
-		t.Fatalf("should change: %#v %#v", cmd.scadaHTTP, cmd.scadaProvider)
-	}
-
-	// Original provider and listener must be closed
-	if !provider1.IsShutdown() {
-		t.Fatalf("should be shutdown")
-	}
-	if _, err := http1.listener.Accept(); !strings.Contains(err.Error(), "closed") {
-		t.Fatalf("should be closed")
-	}
-}
-
 func TestProtectDataDir(t *testing.T) {
-	dir, err := ioutil.TempDir("", "consul")
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	dir := testutil.TempDir(t, "consul")
 	defer os.RemoveAll(dir)
 
 	if err := os.MkdirAll(filepath.Join(dir, "mdb"), 0700); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
-	cfgFile, err := ioutil.TempFile("", "consul")
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	cfgFile := testutil.TempFile(t, "consul")
 	defer os.Remove(cfgFile.Name())
 
 	content := fmt.Sprintf(`{"server": true, "data_dir": "%s"}`, dir)
-	_, err = cfgFile.Write([]byte(content))
+	_, err := cfgFile.Write([]byte(content))
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -449,10 +431,7 @@ func TestProtectDataDir(t *testing.T) {
 }
 
 func TestBadDataDirPermissions(t *testing.T) {
-	dir, err := ioutil.TempDir("", "consul")
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	dir := testutil.TempDir(t, "consul")
 	defer os.RemoveAll(dir)
 
 	dataDir := filepath.Join(dir, "mdb")

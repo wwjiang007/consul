@@ -35,7 +35,7 @@ func (s *Server) dispatchSnapshotRequest(args *structs.SnapshotRequest, in io.Re
 			return nil, structs.ErrNoDCPath
 		}
 
-		snap, err := SnapshotRPC(s.connPool, dc, server.Addr, args, in, reply)
+		snap, err := SnapshotRPC(s.connPool, dc, server.Addr, server.UseTLS, args, in, reply)
 		if err != nil {
 			manager.NotifyFailedServer(server)
 			return nil, err
@@ -50,7 +50,7 @@ func (s *Server) dispatchSnapshotRequest(args *structs.SnapshotRequest, in io.Re
 			if server == nil {
 				return nil, structs.ErrNoLeader
 			}
-			return SnapshotRPC(s.connPool, args.Datacenter, server.Addr, args, in, reply)
+			return SnapshotRPC(s.connPool, args.Datacenter, server.Addr, server.UseTLS, args, in, reply)
 		}
 	}
 
@@ -100,11 +100,38 @@ func (s *Server) dispatchSnapshotRequest(args *structs.SnapshotRequest, in io.Re
 		if err := barrier.Error(); err != nil {
 			return nil, err
 		}
-		if err := s.revokeLeadership(); err != nil {
-			return nil, err
+
+		// This'll be used for feedback from the leader loop.
+		errCh := make(chan error, 1)
+		timeoutCh := time.After(time.Minute)
+
+		select {
+		// Tell the leader loop to reassert leader actions since we just
+		// replaced the state store contents.
+		case s.reassertLeaderCh <- errCh:
+
+		// We might have lost leadership while waiting to kick the loop.
+		case <-timeoutCh:
+			return nil, fmt.Errorf("timed out waiting to re-run leader actions")
+
+		// Make sure we don't get stuck during shutdown
+		case <-s.shutdownCh:
 		}
-		if err := s.establishLeadership(); err != nil {
-			return nil, err
+
+		select {
+		// Wait for the leader loop to finish up.
+		case err := <-errCh:
+			if err != nil {
+				return nil, err
+			}
+
+		// We might have lost leadership while the loop was doing its
+		// thing.
+		case <-timeoutCh:
+			return nil, fmt.Errorf("timed out waiting for re-run of leader actions")
+
+		// Make sure we don't get stuck during shutdown
+		case <-s.shutdownCh:
 		}
 
 		// Give the caller back an empty reader since there's nothing to
@@ -160,10 +187,10 @@ RESPOND:
 // the streaming output (for a snapshot). If the reply contains an error, this
 // will always return an error as well, so you don't need to check the error
 // inside the filled-in reply.
-func SnapshotRPC(pool *ConnPool, dc string, addr net.Addr,
+func SnapshotRPC(pool *ConnPool, dc string, addr net.Addr, useTLS bool,
 	args *structs.SnapshotRequest, in io.Reader, reply *structs.SnapshotResponse) (io.ReadCloser, error) {
 
-	conn, hc, err := pool.DialTimeout(dc, addr, 10*time.Second)
+	conn, hc, err := pool.DialTimeout(dc, addr, 10*time.Second, useTLS)
 	if err != nil {
 		return nil, err
 	}

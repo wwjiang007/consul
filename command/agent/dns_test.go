@@ -14,6 +14,7 @@ import (
 	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/testrpc"
+	"github.com/hashicorp/consul/testutil/retry"
 	"github.com/miekg/dns"
 )
 
@@ -1279,6 +1280,7 @@ func TestDNS_ServiceLookup_WanAddress(t *testing.T) {
 		func(c *Config) {
 			c.Datacenter = "dc1"
 			c.TranslateWanAddrs = true
+			c.ACLDatacenter = ""
 		}, nil)
 	defer os.RemoveAll(dir1)
 	defer srv1.Shutdown()
@@ -1286,6 +1288,7 @@ func TestDNS_ServiceLookup_WanAddress(t *testing.T) {
 	dir2, srv2 := makeDNSServerConfig(t, func(c *Config) {
 		c.Datacenter = "dc2"
 		c.TranslateWanAddrs = true
+		c.ACLDatacenter = ""
 	}, nil)
 	defer os.RemoveAll(dir2)
 	defer srv2.Shutdown()
@@ -1299,15 +1302,19 @@ func TestDNS_ServiceLookup_WanAddress(t *testing.T) {
 	if _, err := srv2.agent.JoinWAN([]string{addr}); err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	retry.Run(t, func(r *retry.R) {
+		if got, want := len(srv1.agent.WANMembers()), 2; got < want {
+			r.Fatalf("got %d WAN members want at least %d", got, want)
+		}
+		if got, want := len(srv2.agent.WANMembers()), 2; got < want {
+			r.Fatalf("got %d WAN members want at least %d", got, want)
+		}
+	})
 
-	if err := testrpc.WaitForResult(func() (bool, error) {
-		return len(srv1.agent.WANMembers()) > 1, nil
-	}); err != nil {
-		t.Fatalf("Failed waiting for WAN join: %v", err)
-	}
-
-	// Register a remote node with a service.
-	{
+	// Register a remote node with a service. This is in a retry since we
+	// need the datacenter to have a route which takes a little more time
+	// beyond the join, and we don't have direct access to the router here.
+	retry.Run(t, func(r *retry.R) {
 		args := &structs.RegisterRequest{
 			Datacenter: "dc2",
 			Node:       "foo",
@@ -1322,9 +1329,9 @@ func TestDNS_ServiceLookup_WanAddress(t *testing.T) {
 
 		var out struct{}
 		if err := srv2.agent.RPC("Catalog.Register", args, &out); err != nil {
-			t.Fatalf("err: %v", err)
+			r.Fatalf("err: %v", err)
 		}
-	}
+	})
 
 	// Register an equivalent prepared query.
 	var id string
@@ -3375,14 +3382,19 @@ func TestDNS_PreparedQuery_Failover(t *testing.T) {
 	if _, err := srv2.agent.JoinWAN([]string{addr}); err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if err := testrpc.WaitForResult(func() (bool, error) {
-		return len(srv1.agent.WANMembers()) > 1, nil
-	}); err != nil {
-		t.Fatalf("Failed waiting for WAN join: %v", err)
-	}
+	retry.Run(t, func(r *retry.R) {
+		if got, want := len(srv1.agent.WANMembers()), 2; got < want {
+			r.Fatalf("got %d WAN members want at least %d", got, want)
+		}
+		if got, want := len(srv2.agent.WANMembers()), 2; got < want {
+			r.Fatalf("got %d WAN members want at least %d", got, want)
+		}
+	})
 
-	// Register a remote node with a service.
-	{
+	// Register a remote node with a service. This is in a retry since we
+	// need the datacenter to have a route which takes a little more time
+	// beyond the join, and we don't have direct access to the router here.
+	retry.Run(t, func(r *retry.R) {
 		args := &structs.RegisterRequest{
 			Datacenter: "dc2",
 			Node:       "foo",
@@ -3397,9 +3409,9 @@ func TestDNS_PreparedQuery_Failover(t *testing.T) {
 
 		var out struct{}
 		if err := srv2.agent.RPC("Catalog.Register", args, &out); err != nil {
-			t.Fatalf("err: %v", err)
+			r.Fatalf("err: %v", err)
 		}
-	}
+	})
 
 	// Register a local prepared query.
 	{

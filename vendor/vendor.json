@@ -360,10 +360,10 @@
 			"revisionTime": "2016-08-09T18:56:09Z"
 		},
 		{
-			"checksumSHA1": "SXjPQfi84j+BFZi4Fl1c/OC/f7M=",
+			"checksumSHA1": "Eh3iu/9RzHzNY4vHHPKaZISAgBo=",
 			"path": "github.com/docker/docker/pkg/system",
-			"revision": "f1571e8b67b4014189e356d20d4f388f0e9e88d3",
-			"revisionTime": "2017-04-28T23:08:38Z"
+			"revision": "eb28dde01f165849bf372e18200e83042c76f26c",
+			"revisionTime": "2016-08-09T18:56:09Z"
 		},
 		{
 			"checksumSHA1": "hZV62Xzt/i0e/WBKWww3rpkRAR4=",
@@ -612,10 +612,10 @@
 			"revisionTime": "2015-11-16T02:03:38Z"
 		},
 		{
-			"checksumSHA1": "NvFexY/rs9sPfve+ny/rkMkCL5M=",
+			"checksumSHA1": "8Na6qG9taUXHDunMYecGxbHbJKE=",
 			"path": "github.com/hashicorp/raft",
-			"revision": "6b063a18bfe6e0da3fdc2b9bf6256be9c0a4849a",
-			"revisionTime": "2017-03-16T02:42:32Z",
+			"revision": "939ebd2103731c2f38c7964d8dd24af0e1b26dc3",
+			"revisionTime": "2017-05-04T20:16:11Z",
 			"version": "library-v2-stage-one",
 			"versionExact": "library-v2-stage-one"
 		},
@@ -628,12 +628,6 @@
 		{
 			"checksumSHA1": "u9qHbpIgMZ7/fjO0gFfds2m/1ck=",
 			"path": "github.com/hashicorp/scada-client",
-			"revision": "6e896784f66f82cdc6f17e00052db91699dc277d",
-			"revisionTime": "2016-06-01T22:40:23Z"
-		},
-		{
-			"checksumSHA1": "fv3nX1vDZViW0tA7Aa5Va2lBUtM=",
-			"path": "github.com/hashicorp/scada-client/scada",
 			"revision": "6e896784f66f82cdc6f17e00052db91699dc277d",
 			"revisionTime": "2016-06-01T22:40:23Z"
 		},

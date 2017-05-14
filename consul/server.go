@@ -174,6 +174,10 @@ type Server struct {
 	// Consul servers.
 	statsFetcher *StatsFetcher
 
+	// reassertLeaderCh is used to signal the leader loop should re-run
+	// leadership actions after a snapshot restore.
+	reassertLeaderCh chan chan error
+
 	// tombstoneGC is used to track the pending GC invocations
 	// for the KV tombstones
 	tombstoneGC *state.TombstoneGC
@@ -210,7 +214,7 @@ type endpoints struct {
 // configuration, potentially returning an error
 func NewServer(config *Config) (*Server, error) {
 	// Check the protocol version.
-	if err := config.CheckVersion(); err != nil {
+	if err := config.CheckProtocolVersion(); err != nil {
 		return nil, err
 	}
 
@@ -229,6 +233,11 @@ func NewServer(config *Config) (*Server, error) {
 		config.LogOutput = os.Stderr
 	}
 	logger := log.New(config.LogOutput, "", log.LstdFlags)
+
+	// Check if TLS is enabled
+	if config.CAFile != "" || config.CAPath != "" {
+		config.UseTLS = true
+	}
 
 	// Create the TLS wrapper for outgoing connections.
 	tlsConf := config.tlsConfig()
@@ -257,7 +266,7 @@ func NewServer(config *Config) (*Server, error) {
 		autopilotRemoveDeadCh: make(chan struct{}),
 		autopilotShutdownCh:   make(chan struct{}),
 		config:                config,
-		connPool:              NewPool(config.LogOutput, serverRPCCache, serverMaxStreams, tlsWrap),
+		connPool:              NewPool(config.RPCSrcAddr, config.LogOutput, serverRPCCache, serverMaxStreams, tlsWrap, config.VerifyOutgoing),
 		eventChLAN:            make(chan serf.Event, 256),
 		eventChWAN:            make(chan serf.Event, 256),
 		localConsuls:          make(map[raft.ServerAddress]*agent.Server),
@@ -266,6 +275,7 @@ func NewServer(config *Config) (*Server, error) {
 		router:                servers.NewRouter(logger, shutdownCh, config.Datacenter),
 		rpcServer:             rpc.NewServer(),
 		rpcTLS:                incomingTLS,
+		reassertLeaderCh:      make(chan chan error),
 		tombstoneGC:           gc,
 		shutdownCh:            make(chan struct{}),
 	}
@@ -387,6 +397,9 @@ func (s *Server) setupSerf(conf *serf.Config, ch chan serf.Event, path string, w
 	}
 	if s.config.NonVoter {
 		conf.Tags["nonvoter"] = "1"
+	}
+	if s.config.UseTLS {
+		conf.Tags["use_tls"] = "1"
 	}
 	conf.MemberlistConfig.LogOutput = s.config.LogOutput
 	conf.LogOutput = s.config.LogOutput
@@ -513,10 +526,17 @@ func (s *Server) setupRaft() error {
 			}
 		} else if _, err := os.Stat(peersFile); err == nil {
 			s.logger.Printf("[INFO] consul: found peers.json file, recovering Raft configuration...")
-			configuration, err := raft.ReadPeersJSON(peersFile)
+
+			var configuration raft.Configuration
+			if s.config.RaftConfig.ProtocolVersion < 3 {
+				configuration, err = raft.ReadPeersJSON(peersFile)
+			} else {
+				configuration, err = raft.ReadConfigJSON(peersFile)
+			}
 			if err != nil {
 				return fmt.Errorf("recovery failed to parse peers.json: %v", err)
 			}
+
 			tmpFsm, err := NewFSM(s.tombstoneGC, s.config.LogOutput)
 			if err != nil {
 				return fmt.Errorf("recovery failed to make temp FSM: %v", err)
@@ -525,6 +545,7 @@ func (s *Server) setupRaft() error {
 				log, stable, snap, trans, configuration); err != nil {
 				return fmt.Errorf("recovery failed: %v", err)
 			}
+
 			if err := os.Remove(peersFile); err != nil {
 				return fmt.Errorf("recovery failed to delete peers.json, please delete manually (see peers.info for details): %v", err)
 			}
@@ -598,34 +619,39 @@ func (s *Server) setupRPC(tlsWrap tlsutil.DCWrapper) error {
 	s.rpcServer.Register(s.endpoints.Status)
 	s.rpcServer.Register(s.endpoints.Txn)
 
-	list, err := net.ListenTCP("tcp", s.config.RPCAddr)
+	ln, err := net.ListenTCP("tcp", s.config.RPCAddr)
 	if err != nil {
 		return err
 	}
-	s.rpcListener = list
-
-	var advertise net.Addr
-	if s.config.RPCAdvertise != nil {
-		advertise = s.config.RPCAdvertise
-	} else {
-		advertise = s.rpcListener.Addr()
-	}
+	s.rpcListener = ln
 
 	// Verify that we have a usable advertise address
-	addr, ok := advertise.(*net.TCPAddr)
-	if !ok {
-		list.Close()
-		return fmt.Errorf("RPC advertise address is not a TCP Address: %v", addr)
-	}
-	if addr.IP.IsUnspecified() {
-		list.Close()
-		return fmt.Errorf("RPC advertise address is not advertisable: %v", addr)
+	if s.config.RPCAdvertise.IP.IsUnspecified() {
+		ln.Close()
+		return fmt.Errorf("RPC advertise address is not advertisable: %v", s.config.RPCAdvertise)
 	}
 
 	// Provide a DC specific wrapper. Raft replication is only
 	// ever done in the same datacenter, so we can provide it as a constant.
 	wrapper := tlsutil.SpecificDC(s.config.Datacenter, tlsWrap)
-	s.raftLayer = NewRaftLayer(advertise, wrapper)
+
+	// Define a callback for determining whether to wrap a connection with TLS
+	tlsFunc := func(address raft.ServerAddress) bool {
+		if s.config.VerifyOutgoing {
+			return true
+		}
+
+		s.localLock.RLock()
+		server, ok := s.localConsuls[address]
+		s.localLock.RUnlock()
+
+		if !ok {
+			return false
+		}
+
+		return server.UseTLS
+	}
+	s.raftLayer = NewRaftLayer(s.config.RPCSrcAddr, s.config.RPCAdvertise, wrapper, tlsFunc)
 	return nil
 }
 
@@ -972,10 +998,54 @@ func (s *Server) GetWANCoordinate() (*coordinate.Coordinate, error) {
 // location.
 const peersInfoContent = `
 As of Consul 0.7.0, the peers.json file is only used for recovery
-after an outage. It should be formatted as a JSON array containing the address
-and port of each Consul server in the cluster, like this:
+after an outage. The format of this file depends on what the server has
+configured for its Raft protocol version. Please see the agent configuration
+page at https://www.consul.io/docs/agent/options.html#_raft_protocol for more
+details about this parameter.
 
-["10.1.0.1:8300","10.1.0.2:8300","10.1.0.3:8300"]
+For Raft protocol version 2 and earlier, this should be formatted as a JSON
+array containing the address and port of each Consul server in the cluster, like
+this:
+
+[
+  "10.1.0.1:8300",
+  "10.1.0.2:8300",
+  "10.1.0.3:8300"
+]
+
+For Raft protocol version 3 and later, this should be formatted as a JSON
+array containing the node ID, address:port, and suffrage information of each
+Consul server in the cluster, like this:
+
+[
+  {
+    "id": "adf4238a-882b-9ddc-4a9d-5b6758e4159e",
+    "address": "10.1.0.1:8300",
+    "non_voter": false
+  },
+  {
+    "id": "8b6dda82-3103-11e7-93ae-92361f002671",
+    "address": "10.1.0.2:8300",
+    "non_voter": false
+  },
+  {
+    "id": "97e17742-3103-11e7-93ae-92361f002671",
+    "address": "10.1.0.3:8300",
+    "non_voter": false
+  }
+]
+
+The "id" field is the node ID of the server. This can be found in the logs when
+the server starts up, or in the "node-id" file inside the server's data
+directory.
+
+The "address" field is the address and port of the server.
+
+The "non_voter" field controls whether the server is a non-voter, which is used
+in some advanced Autopilot configurations, please see
+https://www.consul.io/docs/guides/autopilot.html for more information. If
+"non_voter" is omitted it will default to false, which is typical for most
+clusters.
 
 Under normal operation, the peers.json file will not be present.
 

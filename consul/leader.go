@@ -65,9 +65,6 @@ func (s *Server) monitorLeadership() {
 // leaderLoop runs as long as we are the leader to run various
 // maintenance activities
 func (s *Server) leaderLoop(stopCh chan struct{}) {
-	// Ensure we revoke leadership on stepdown
-	defer s.revokeLeadership()
-
 	// Fire a user event indicating a new leader
 	payload := []byte(s.config.NodeName)
 	if err := s.serfLAN.UserEvent(newLeaderEvent, payload, false); err != nil {
@@ -78,6 +75,19 @@ func (s *Server) leaderLoop(stopCh chan struct{}) {
 	// has succeeded
 	var reconcileCh chan serf.Member
 	establishedLeader := false
+
+	reassert := func() error {
+		if !establishedLeader {
+			return fmt.Errorf("leadership has not been established")
+		}
+		if err := s.revokeLeadership(); err != nil {
+			return err
+		}
+		if err := s.establishLeadership(); err != nil {
+			return err
+		}
+		return nil
+	}
 
 RECONCILE:
 	// Setup a reconciliation timer
@@ -96,11 +106,11 @@ RECONCILE:
 	// Check if we need to handle initial leadership actions
 	if !establishedLeader {
 		if err := s.establishLeadership(); err != nil {
-			s.logger.Printf("[ERR] consul: failed to establish leadership: %v",
-				err)
+			s.logger.Printf("[ERR] consul: failed to establish leadership: %v", err)
 			goto WAIT
 		}
 		establishedLeader = true
+		defer s.revokeLeadership()
 	}
 
 	// Reconcile any missing data
@@ -128,6 +138,8 @@ WAIT:
 			s.reconcileMember(member)
 		case index := <-s.tombstoneGC.ExpireCh():
 			go s.reapTombstones(index)
+		case errCh := <-s.reassertLeaderCh:
+			errCh <- reassert()
 		}
 	}
 }

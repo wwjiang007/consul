@@ -1,16 +1,15 @@
 package agent
 
 import (
-	"os"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/consul/consul/structs"
-	"github.com/hashicorp/consul/testrpc"
 	"github.com/hashicorp/consul/testutil/retry"
 )
 
 func TestValidateUserEventParams(t *testing.T) {
+	t.Parallel()
 	p := &UserEvent{}
 	err := validateUserEventParams(p)
 	if err == nil || err.Error() != "User event missing name" {
@@ -47,10 +46,9 @@ func TestValidateUserEventParams(t *testing.T) {
 }
 
 func TestShouldProcessUserEvent(t *testing.T) {
-	conf := nextConfig()
-	dir, agent := makeAgent(t, conf)
-	defer os.RemoveAll(dir)
-	defer agent.Shutdown()
+	t.Parallel()
+	a := NewTestAgent(t.Name(), nil)
+	defer a.Shutdown()
 
 	srv1 := &structs.NodeService{
 		ID:      "mysql",
@@ -58,10 +56,10 @@ func TestShouldProcessUserEvent(t *testing.T) {
 		Tags:    []string{"test", "foo", "bar", "master"},
 		Port:    5000,
 	}
-	agent.state.AddService(srv1, "")
+	a.state.AddService(srv1, "")
 
 	p := &UserEvent{}
-	if !agent.shouldProcessUserEvent(p) {
+	if !a.shouldProcessUserEvent(p) {
 		t.Fatalf("bad")
 	}
 
@@ -69,7 +67,7 @@ func TestShouldProcessUserEvent(t *testing.T) {
 	p = &UserEvent{
 		NodeFilter: "foobar",
 	}
-	if agent.shouldProcessUserEvent(p) {
+	if a.shouldProcessUserEvent(p) {
 		t.Fatalf("bad")
 	}
 
@@ -77,7 +75,7 @@ func TestShouldProcessUserEvent(t *testing.T) {
 	p = &UserEvent{
 		NodeFilter: "^Node",
 	}
-	if !agent.shouldProcessUserEvent(p) {
+	if !a.shouldProcessUserEvent(p) {
 		t.Fatalf("bad")
 	}
 
@@ -85,7 +83,7 @@ func TestShouldProcessUserEvent(t *testing.T) {
 	p = &UserEvent{
 		ServiceFilter: "foobar",
 	}
-	if agent.shouldProcessUserEvent(p) {
+	if a.shouldProcessUserEvent(p) {
 		t.Fatalf("bad")
 	}
 
@@ -93,7 +91,7 @@ func TestShouldProcessUserEvent(t *testing.T) {
 	p = &UserEvent{
 		ServiceFilter: ".*sql",
 	}
-	if !agent.shouldProcessUserEvent(p) {
+	if !a.shouldProcessUserEvent(p) {
 		t.Fatalf("bad")
 	}
 
@@ -102,7 +100,7 @@ func TestShouldProcessUserEvent(t *testing.T) {
 		ServiceFilter: ".*sql",
 		TagFilter:     "slave",
 	}
-	if agent.shouldProcessUserEvent(p) {
+	if a.shouldProcessUserEvent(p) {
 		t.Fatalf("bad")
 	}
 
@@ -111,24 +109,23 @@ func TestShouldProcessUserEvent(t *testing.T) {
 		ServiceFilter: ".*sql",
 		TagFilter:     "master",
 	}
-	if !agent.shouldProcessUserEvent(p) {
+	if !a.shouldProcessUserEvent(p) {
 		t.Fatalf("bad")
 	}
 }
 
 func TestIngestUserEvent(t *testing.T) {
-	conf := nextConfig()
-	dir, agent := makeAgent(t, conf)
-	defer os.RemoveAll(dir)
-	defer agent.Shutdown()
+	t.Parallel()
+	a := NewTestAgent(t.Name(), nil)
+	defer a.Shutdown()
 
 	for i := 0; i < 512; i++ {
 		msg := &UserEvent{LTime: uint64(i), Name: "test"}
-		agent.ingestUserEvent(msg)
-		if agent.LastUserEvent() != msg {
+		a.ingestUserEvent(msg)
+		if a.LastUserEvent() != msg {
 			t.Fatalf("bad: %#v", msg)
 		}
-		events := agent.UserEvents()
+		events := a.UserEvents()
 
 		expectLen := 256
 		if i < 256 {
@@ -149,12 +146,9 @@ func TestIngestUserEvent(t *testing.T) {
 }
 
 func TestFireReceiveEvent(t *testing.T) {
-	conf := nextConfig()
-	dir, agent := makeAgent(t, conf)
-	defer os.RemoveAll(dir)
-	defer agent.Shutdown()
-
-	testrpc.WaitForLeader(t, agent.RPC, "dc1")
+	t.Parallel()
+	a := NewTestAgent(t.Name(), nil)
+	defer a.Shutdown()
 
 	srv1 := &structs.NodeService{
 		ID:      "mysql",
@@ -162,42 +156,37 @@ func TestFireReceiveEvent(t *testing.T) {
 		Tags:    []string{"test", "foo", "bar", "master"},
 		Port:    5000,
 	}
-	agent.state.AddService(srv1, "")
+	a.state.AddService(srv1, "")
 
 	p1 := &UserEvent{Name: "deploy", ServiceFilter: "web"}
-	err := agent.UserEvent("dc1", "root", p1)
+	err := a.UserEvent("dc1", "root", p1)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
 	p2 := &UserEvent{Name: "deploy"}
-	err = agent.UserEvent("dc1", "root", p2)
+	err = a.UserEvent("dc1", "root", p2)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	retry.Run(t, func(r *retry.R) {
-		if got, want := len(agent.UserEvents()), 1; got != want {
+		if got, want := len(a.UserEvents()), 1; got != want {
 			r.Fatalf("got %d events want %d", got, want)
 		}
 	})
 
-	last := agent.LastUserEvent()
+	last := a.LastUserEvent()
 	if last.ID != p2.ID {
 		t.Fatalf("bad: %#v", last)
 	}
 }
 
 func TestUserEventToken(t *testing.T) {
-	conf := nextConfig()
-
-	// Set the default policies to deny
-	conf.ACLDefaultPolicy = "deny"
-
-	dir, agent := makeAgent(t, conf)
-	defer os.RemoveAll(dir)
-	defer agent.Shutdown()
-
-	testrpc.WaitForLeader(t, agent.RPC, "dc1")
+	t.Parallel()
+	cfg := TestACLConfig()
+	cfg.ACLDefaultPolicy = "deny" // Set the default policies to deny
+	a := NewTestAgent(t.Name(), cfg)
+	defer a.Shutdown()
 
 	// Create an ACL token
 	args := structs.ACLRequest{
@@ -211,7 +200,7 @@ func TestUserEventToken(t *testing.T) {
 		WriteRequest: structs.WriteRequest{Token: "root"},
 	}
 	var token string
-	if err := agent.RPC("ACL.Apply", &args, &token); err != nil {
+	if err := a.RPC("ACL.Apply", &args, &token); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -227,7 +216,7 @@ func TestUserEventToken(t *testing.T) {
 	}
 	for _, c := range cases {
 		event := &UserEvent{Name: c.name}
-		err := agent.UserEvent("dc1", token, event)
+		err := a.UserEvent("dc1", token, event)
 		allowed := false
 		if err == nil || err.Error() != permissionDenied {
 			allowed = true

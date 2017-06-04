@@ -9,11 +9,13 @@ import (
 )
 
 func TestKeygenCommand_implements(t *testing.T) {
+	t.Parallel()
 	var _ cli.Command = &KeygenCommand{}
 }
 
 func TestKeygenCommand(t *testing.T) {
-	ui := new(cli.MockUi)
+	t.Parallel()
+	ui := cli.NewMockUi()
 	c := &KeygenCommand{
 		Command: base.Command{
 			UI:    ui,

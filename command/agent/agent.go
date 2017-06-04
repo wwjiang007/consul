@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"context"
 	"crypto/sha512"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +11,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -22,9 +25,12 @@ import (
 	"github.com/hashicorp/consul/consul"
 	"github.com/hashicorp/consul/consul/state"
 	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/consul/ipaddr"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/logger"
 	"github.com/hashicorp/consul/types"
+	"github.com/hashicorp/consul/watch"
+	multierror "github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-sockaddr/template"
 	"github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/raft"
@@ -48,35 +54,47 @@ const (
 		"service, but no reason was provided. This is a default message."
 )
 
-var (
-	// dnsNameRe checks if a name or tag is dns-compatible.
-	dnsNameRe = regexp.MustCompile(`^[a-zA-Z0-9\-]+$`)
-)
+// dnsNameRe checks if a name or tag is dns-compatible.
+var dnsNameRe = regexp.MustCompile(`^[a-zA-Z0-9\-]+$`)
 
-/*
- The agent is the long running process that is run on every machine.
- It exposes an RPC interface that is used by the CLI to control the
- agent. The agent runs the query interfaces like HTTP, DNS, and RPC.
- However, it can run in either a client, or server mode. In server
- mode, it runs a full Consul server. In client-only mode, it only forwards
- requests to other Consul servers.
-*/
+// clientServer defines the interface shared by both
+// consul.Client and consul.Server.
+type clientServer interface {
+	Encrypted() bool
+	GetLANCoordinate() (*coordinate.Coordinate, error)
+	Leave() error
+	LANMembers() []serf.Member
+	LocalMember() serf.Member
+	JoinLAN(addrs []string) (n int, err error)
+	RemoveFailedNode(node string) error
+	RPC(method string, args interface{}, reply interface{}) error
+	SnapshotRPC(args *structs.SnapshotRequest, in io.Reader, out io.Writer, replyFn consul.SnapshotReplyFn) error
+	Shutdown() error
+	Stats() map[string]map[string]string
+}
+
+// The agent is the long running process that is run on every machine.
+// It exposes an RPC interface that is used by the CLI to control the
+// agent. The agent runs the query interfaces like HTTP, DNS, and RPC.
+// However, it can run in either a client, or server mode. In server
+// mode, it runs a full Consul server. In client-only mode, it only forwards
+// requests to other Consul servers.
 type Agent struct {
+	// config is the agent configuration.
 	config *Config
 
 	// Used for writing our logs
 	logger *log.Logger
 
 	// Output sink for logs
-	logOutput io.Writer
+	LogOutput io.Writer
 
 	// Used for streaming logs to
-	logWriter *logger.LogWriter
+	LogWriter *logger.LogWriter
 
-	// We have one of a client or a server, depending
-	// on our configuration
-	server *consul.Server
-	client *consul.Client
+	// delegate is either a *consul.Server or *consul.Client
+	// depending on the configuration
+	delegate clientServer
 
 	// acls is an object that helps manage local ACL enforcement.
 	acls *aclManager
@@ -125,33 +143,55 @@ type Agent struct {
 	shutdownCh   chan struct{}
 	shutdownLock sync.Mutex
 
+	// retryJoinCh transports errors from the retry join
+	// attempts.
+	retryJoinCh chan error
+
 	// endpoints lets you override RPC endpoints for testing. Not all
 	// agent methods use this, so use with care and never override
 	// outside of a unit test.
-	endpoints map[string]string
+	endpoints     map[string]string
+	endpointsLock sync.RWMutex
+
+	// dnsAddr is the address the DNS server binds to
+	dnsAddrs []ProtoAddr
+
+	// dnsServer provides the DNS API
+	dnsServers []*DNSServer
+
+	// httpAddrs are the addresses per protocol the HTTP server binds to
+	httpAddrs []ProtoAddr
+
+	// httpServers provides the HTTP API on various endpoints
+	httpServers []*HTTPServer
+
+	// wgServers is the wait group for all HTTP and DNS servers
+	wgServers sync.WaitGroup
 }
 
-// Create is used to create a new Agent. Returns
-// the agent or potentially an error.
-func Create(config *Config, logOutput io.Writer, logWriter *logger.LogWriter, reloadCh chan chan error) (*Agent, error) {
-	// Ensure we have a log sink
-	if logOutput == nil {
-		logOutput = os.Stderr
-	}
-
-	// Validate the config
-	if config.Datacenter == "" {
+func NewAgent(c *Config) (*Agent, error) {
+	if c.Datacenter == "" {
 		return nil, fmt.Errorf("Must configure a Datacenter")
 	}
-	if config.DataDir == "" && !config.DevMode {
+	if c.DataDir == "" && !c.DevMode {
 		return nil, fmt.Errorf("Must configure a DataDir")
 	}
+	dnsAddrs, err := c.DNSAddrs()
+	if err != nil {
+		return nil, fmt.Errorf("Invalid DNS bind address: %s", err)
+	}
+	httpAddrs, err := c.HTTPAddrs()
+	if err != nil {
+		return nil, fmt.Errorf("Invalid HTTP bind address: %s", err)
+	}
+	acls, err := newACLManager(c)
+	if err != nil {
+		return nil, err
+	}
 
-	agent := &Agent{
-		config:         config,
-		logger:         log.New(logOutput, "", log.LstdFlags),
-		logOutput:      logOutput,
-		logWriter:      logWriter,
+	a := &Agent{
+		config:         c,
+		acls:           acls,
 		checkReapAfter: make(map[types.CheckID]time.Duration),
 		checkMonitors:  make(map[types.CheckID]*CheckMonitor),
 		checkTTLs:      make(map[types.CheckID]*CheckTTL),
@@ -160,82 +200,290 @@ func Create(config *Config, logOutput io.Writer, logWriter *logger.LogWriter, re
 		checkDockers:   make(map[types.CheckID]*CheckDocker),
 		eventCh:        make(chan serf.UserEvent, 1024),
 		eventBuf:       make([]*UserEvent, 256),
-		reloadCh:       reloadCh,
+		reloadCh:       make(chan chan error),
+		retryJoinCh:    make(chan error),
 		shutdownCh:     make(chan struct{}),
 		endpoints:      make(map[string]string),
+		dnsAddrs:       dnsAddrs,
+		httpAddrs:      httpAddrs,
 	}
-	if err := agent.resolveTmplAddrs(); err != nil {
+	if err := a.resolveTmplAddrs(); err != nil {
 		return nil, err
 	}
+	return a, nil
+}
 
-	// Initialize the ACL manager.
-	acls, err := newACLManager(config)
-	if err != nil {
-		return nil, err
+func (a *Agent) Start() error {
+	c := a.config
+
+	logOutput := a.LogOutput
+	if a.logger == nil {
+		if logOutput == nil {
+			logOutput = os.Stderr
+		}
+		a.logger = log.New(logOutput, "", log.LstdFlags)
 	}
-	agent.acls = acls
 
 	// Retrieve or generate the node ID before setting up the rest of the
 	// agent, which depends on it.
-	if err := agent.setupNodeID(config); err != nil {
-		return nil, fmt.Errorf("Failed to setup node ID: %v", err)
+	if err := a.setupNodeID(c); err != nil {
+		return fmt.Errorf("Failed to setup node ID: %v", err)
 	}
 
 	// Initialize the local state.
-	agent.state.Init(config, agent.logger)
+	a.state.Init(c, a.logger)
 
 	// Setup either the client or the server.
-	if config.Server {
-		err = agent.setupServer()
-		agent.state.SetIface(agent.server)
+	if c.Server {
+		server, err := a.makeServer()
+		if err != nil {
+			return err
+		}
+
+		a.delegate = server
+		a.state.SetIface(server)
 
 		// Automatically register the "consul" service on server nodes
 		consulService := structs.NodeService{
 			Service: consul.ConsulServiceName,
 			ID:      consul.ConsulServiceID,
-			Port:    agent.config.Ports.Server,
+			Port:    c.Ports.Server,
 			Tags:    []string{},
 		}
 
-		agent.state.AddService(&consulService, agent.config.GetTokenForAgent())
+		a.state.AddService(&consulService, c.GetTokenForAgent())
 	} else {
-		err = agent.setupClient()
-		agent.state.SetIface(agent.client)
-	}
-	if err != nil {
-		return nil, err
+		client, err := a.makeClient()
+		if err != nil {
+			return err
+		}
+
+		a.delegate = client
+		a.state.SetIface(client)
 	}
 
 	// Load checks/services/metadata.
-	if err := agent.loadServices(config); err != nil {
-		return nil, err
+	if err := a.loadServices(c); err != nil {
+		return err
 	}
-	if err := agent.loadChecks(config); err != nil {
-		return nil, err
+	if err := a.loadChecks(c); err != nil {
+		return err
 	}
-	if err := agent.loadMetadata(config); err != nil {
-		return nil, err
+	if err := a.loadMetadata(c); err != nil {
+		return err
 	}
 
 	// Start watching for critical services to deregister, based on their
 	// checks.
-	go agent.reapServices()
+	go a.reapServices()
 
 	// Start handling events.
-	go agent.handleEvents()
+	go a.handleEvents()
 
 	// Start sending network coordinate to the server.
-	if !config.DisableCoordinates {
-		go agent.sendCoordinate()
+	if !c.DisableCoordinates {
+		go a.sendCoordinate()
 	}
 
 	// Write out the PID file if necessary.
-	err = agent.storePid()
+	if err := a.storePid(); err != nil {
+		return err
+	}
+
+	// start DNS servers
+	if err := a.listenAndServeDNS(); err != nil {
+		return err
+	}
+
+	// create listeners and unstarted servers
+	// see comment on listenHTTP why we are doing this
+	httpln, err := a.listenHTTP(a.httpAddrs)
+	if err != nil {
+		return err
+	}
+
+	// start HTTP servers
+	for _, l := range httpln {
+		srv := NewHTTPServer(l.Addr().String(), a)
+		if err := a.serveHTTP(l, srv); err != nil {
+			return err
+		}
+		a.httpServers = append(a.httpServers, srv)
+	}
+
+	// start retry join
+	go a.retryJoin()
+	go a.retryJoinWan()
+
+	return nil
+}
+
+func (a *Agent) listenAndServeDNS() error {
+	notif := make(chan ProtoAddr, len(a.dnsAddrs))
+	for _, p := range a.dnsAddrs {
+		p := p // capture loop var
+
+		// create server
+		s, err := NewDNSServer(a)
+		if err != nil {
+			return err
+		}
+		a.dnsServers = append(a.dnsServers, s)
+
+		// start server
+		a.wgServers.Add(1)
+		go func() {
+			defer a.wgServers.Done()
+
+			err := s.ListenAndServe(p.Net, p.Addr, func() { notif <- p })
+			if err != nil && !strings.Contains(err.Error(), "accept") {
+				a.logger.Printf("[ERR] agent: Error starting DNS server %s (%s): %v", p.Addr, p.Net, err)
+			}
+		}()
+	}
+
+	// wait for servers to be up
+	timeout := time.After(time.Second)
+	for range a.dnsAddrs {
+		select {
+		case p := <-notif:
+			a.logger.Printf("[INFO] agent: Started DNS server %s (%s)", p.Addr, p.Net)
+			continue
+		case <-timeout:
+			return fmt.Errorf("agent: timeout starting DNS servers")
+		}
+	}
+	return nil
+}
+
+// listenHTTP binds listeners to the provided addresses and also returns
+// pre-configured HTTP servers which are not yet started. The motivation is
+// that in the current startup/shutdown setup we de-couple the listener
+// creation from the server startup assuming that if any of the listeners
+// cannot be bound we fail immediately and later failures do not occur.
+// Therefore, starting a server with a running listener is assumed to not
+// produce an error.
+//
+// The second motivation is that an HTTPS server needs to use the same TLSConfig
+// on both the listener and the HTTP server. When listeners and servers are
+// created at different times this becomes difficult to handle without keeping
+// the TLS configuration somewhere or recreating it.
+//
+// This approach should ultimately be refactored to the point where we just
+// start the server and any error should trigger a proper shutdown of the agent.
+func (a *Agent) listenHTTP(addrs []ProtoAddr) ([]net.Listener, error) {
+	var ln []net.Listener
+	for _, p := range addrs {
+		var l net.Listener
+		var err error
+
+		switch {
+		case p.Net == "unix":
+			l, err = a.listenSocket(p.Addr, a.config.UnixSockets)
+
+		case p.Net == "tcp" && p.Proto == "http":
+			l, err = net.Listen("tcp", p.Addr)
+
+		case p.Net == "tcp" && p.Proto == "https":
+			var tlscfg *tls.Config
+			tlscfg, err = a.config.IncomingHTTPSConfig()
+			if err != nil {
+				break
+			}
+			l, err = tls.Listen("tcp", p.Addr, tlscfg)
+
+		default:
+			return nil, fmt.Errorf("%s:%s listener not supported", p.Net, p.Proto)
+		}
+
+		if err != nil {
+			for _, l := range ln {
+				l.Close()
+			}
+			return nil, err
+		}
+
+		if tcpl, ok := l.(*net.TCPListener); ok {
+			l = &tcpKeepAliveListener{tcpl}
+		}
+
+		ln = append(ln, l)
+	}
+	return ln, nil
+}
+
+// tcpKeepAliveListener sets TCP keep-alive timeouts on accepted
+// connections. It's used by NewHttpServer so dead TCP connections
+// eventually go away.
+type tcpKeepAliveListener struct {
+	*net.TCPListener
+}
+
+func (ln tcpKeepAliveListener) Accept() (c net.Conn, err error) {
+	tc, err := ln.AcceptTCP()
+	if err != nil {
+		return
+	}
+	tc.SetKeepAlive(true)
+	tc.SetKeepAlivePeriod(30 * time.Second)
+	return tc, nil
+}
+
+func (a *Agent) listenSocket(path string, perm FilePermissions) (net.Listener, error) {
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		a.logger.Printf("[WARN] agent: Replacing socket %q", path)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("error removing socket file: %s", err)
+	}
+	l, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, err
 	}
+	if err := setFilePermissions(path, perm); err != nil {
+		return nil, fmt.Errorf("Failed setting up HTTP socket: %s", err)
+	}
+	return l, nil
+}
 
-	return agent, nil
+func (a *Agent) serveHTTP(l net.Listener, srv *HTTPServer) error {
+	// https://github.com/golang/go/issues/20239
+	//
+	// In go.8.1 there is a race between Serve and Shutdown. If
+	// Shutdown is called before the Serve go routine was scheduled then
+	// the Serve go routine never returns. This deadlocks the agent
+	// shutdown for some tests since it will wait forever.
+	//
+	// Since we need to check for an unexported type (*tls.listener)
+	// we cannot just perform a type check since the compiler won't let
+	// us. We might be able to use reflection but the fmt.Sprintf() hack
+	// works just as well.
+	srv.proto = "http"
+	if strings.Contains("*tls.listener", fmt.Sprintf("%T", l)) {
+		srv.proto = "https"
+	}
+	notif := make(chan string)
+	a.wgServers.Add(1)
+	go func() {
+		defer a.wgServers.Done()
+		notif <- srv.Addr
+		err := srv.Serve(l)
+		if err != nil && err != http.ErrServerClosed {
+			a.logger.Print(err)
+		}
+	}()
+
+	select {
+	case addr := <-notif:
+		if srv.proto == "https" {
+			a.logger.Printf("[INFO] agent: Started HTTPS server on %s", addr)
+		} else {
+			a.logger.Printf("[INFO] agent: Started HTTP server on %s", addr)
+		}
+		return nil
+	case <-time.After(time.Second):
+		return fmt.Errorf("agent: timeout starting HTTP servers")
+	}
 }
 
 // consulConfig is used to return a consul configuration
@@ -305,12 +553,12 @@ func (a *Agent) consulConfig() (*consul.Config, error) {
 		}
 		a.config.AdvertiseAddr = ipStr
 
-	case a.config.BindAddr != "" && !isAddrANY(a.config.BindAddr):
+	case a.config.BindAddr != "" && !ipaddr.IsAny(a.config.BindAddr):
 		a.config.AdvertiseAddr = a.config.BindAddr
 
 	default:
 		ip, err := consul.GetPrivateIP()
-		if a.config.BindAddr == "[::]" {
+		if ipaddr.IsAnyV6(a.config.BindAddr) {
 			ip, err = consul.GetPublicIPv6()
 		}
 		if err != nil {
@@ -363,6 +611,14 @@ func (a *Agent) consulConfig() (*consul.Config, error) {
 	}
 	if a.config.ReconnectTimeoutWan != 0 {
 		base.SerfWANConfig.ReconnectTimeout = a.config.ReconnectTimeoutWan
+	}
+	if a.config.EncryptVerifyIncoming != nil {
+		base.SerfWANConfig.MemberlistConfig.GossipVerifyIncoming = *a.config.EncryptVerifyIncoming
+		base.SerfLANConfig.MemberlistConfig.GossipVerifyIncoming = *a.config.EncryptVerifyIncoming
+	}
+	if a.config.EncryptVerifyOutgoing != nil {
+		base.SerfWANConfig.MemberlistConfig.GossipVerifyOutgoing = *a.config.EncryptVerifyOutgoing
+		base.SerfLANConfig.MemberlistConfig.GossipVerifyOutgoing = *a.config.EncryptVerifyOutgoing
 	}
 	if a.config.AdvertiseAddrs.RPC != nil {
 		base.RPCAdvertise = a.config.AdvertiseAddrs.RPC
@@ -441,7 +697,7 @@ func (a *Agent) consulConfig() (*consul.Config, error) {
 
 	// set the src address for outgoing rpc connections
 	// Use port 0 so that outgoing connections use a random port.
-	if !isAddrANY(base.RPCAddr.IP) {
+	if !ipaddr.IsAny(base.RPCAddr.IP) {
 		base.RPCSrcAddr = &net.TCPAddr{IP: base.RPCAddr.IP}
 	}
 
@@ -481,7 +737,7 @@ func (a *Agent) consulConfig() (*consul.Config, error) {
 	}
 
 	// Setup the loggers
-	base.LogOutput = a.logOutput
+	base.LogOutput = a.LogOutput
 	return base, nil
 }
 
@@ -592,38 +848,36 @@ func (a *Agent) resolveTmplAddrs() error {
 	return nil
 }
 
-// setupServer is used to initialize the Consul server
-func (a *Agent) setupServer() error {
+// makeServer creates a new consul server.
+func (a *Agent) makeServer() (*consul.Server, error) {
 	config, err := a.consulConfig()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := a.setupKeyrings(config); err != nil {
-		return fmt.Errorf("Failed to configure keyring: %v", err)
+		return nil, fmt.Errorf("Failed to configure keyring: %v", err)
 	}
-	server, err := consul.NewServer(config)
+	server, err := consul.NewServerLogger(config, a.logger)
 	if err != nil {
-		return fmt.Errorf("Failed to start Consul server: %v", err)
+		return nil, fmt.Errorf("Failed to start Consul server: %v", err)
 	}
-	a.server = server
-	return nil
+	return server, nil
 }
 
-// setupClient is used to initialize the Consul client
-func (a *Agent) setupClient() error {
+// makeClient creates a new consul client.
+func (a *Agent) makeClient() (*consul.Client, error) {
 	config, err := a.consulConfig()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := a.setupKeyrings(config); err != nil {
-		return fmt.Errorf("Failed to configure keyring: %v", err)
+		return nil, fmt.Errorf("Failed to configure keyring: %v", err)
 	}
-	client, err := consul.NewClient(config)
+	client, err := consul.NewClientLogger(config, a.logger)
 	if err != nil {
-		return fmt.Errorf("Failed to start Consul client: %v", err)
+		return nil, fmt.Errorf("Failed to start Consul client: %v", err)
 	}
-	a.client = client
-	return nil
+	return client, nil
 }
 
 // makeRandomID will generate a random UUID for a node.
@@ -784,10 +1038,7 @@ LOAD:
 // RPC is used to make an RPC call to the Consul servers
 // This allows the agent to implement the Consul.Interface
 func (a *Agent) RPC(method string, args interface{}, reply interface{}) error {
-	if a.server != nil {
-		return a.server.RPC(method, args, reply)
-	}
-	return a.client.RPC(method, args, reply)
+	return a.delegate.RPC(method, args, reply)
 }
 
 // SnapshotRPC performs the requested snapshot RPC against the Consul server in
@@ -796,19 +1047,12 @@ func (a *Agent) RPC(method string, args interface{}, reply interface{}) error {
 // return payload will be written to out.
 func (a *Agent) SnapshotRPC(args *structs.SnapshotRequest, in io.Reader, out io.Writer,
 	replyFn consul.SnapshotReplyFn) error {
-
-	if a.server != nil {
-		return a.server.SnapshotRPC(args, in, out, replyFn)
-	}
-	return a.client.SnapshotRPC(args, in, out, replyFn)
+	return a.delegate.SnapshotRPC(args, in, out, replyFn)
 }
 
 // Leave is used to prepare the agent for a graceful shutdown
 func (a *Agent) Leave() error {
-	if a.server != nil {
-		return a.server.Leave()
-	}
-	return a.client.Leave()
+	return a.delegate.Leave()
 }
 
 // Shutdown is used to hard stop the agent. Should be
@@ -820,6 +1064,30 @@ func (a *Agent) Shutdown() error {
 	if a.shutdown {
 		return nil
 	}
+	a.logger.Println("[INFO] agent: Requesting shutdown")
+
+	// Stop all API endpoints
+	for _, srv := range a.dnsServers {
+		a.logger.Printf("[INFO] agent: Stopping DNS server %s (%s)", srv.Server.Addr, srv.Server.Net)
+		srv.Shutdown()
+	}
+	for _, srv := range a.httpServers {
+		// http server is HTTPS if TLSConfig is not nil and NextProtos does not only contain "h2"
+		// the latter seems to be a side effect of HTTP/2 support in go 1.8. TLSConfig != nil is
+		// no longer sufficient to check for an HTTPS server.
+		a.logger.Printf("[INFO] agent: Stopping %s server %s", strings.ToUpper(srv.proto), srv.Addr)
+
+		// graceful shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+		if ctx.Err() == context.DeadlineExceeded {
+			a.logger.Printf("[WARN] agent: Timeout stopping %s server %s", strings.ToUpper(srv.proto), srv.Addr)
+		}
+	}
+	a.logger.Println("[INFO] agent: Waiting for endpoints to shut down")
+	a.wgServers.Wait()
+	a.logger.Print("[INFO] agent: Endpoints down")
 
 	// Stop all the checks
 	a.checkLock.Lock()
@@ -839,12 +1107,14 @@ func (a *Agent) Shutdown() error {
 		chk.Stop()
 	}
 
-	a.logger.Println("[INFO] agent: requesting shutdown")
 	var err error
-	if a.server != nil {
-		err = a.server.Shutdown()
-	} else {
-		err = a.client.Shutdown()
+	if a.delegate != nil {
+		err = a.delegate.Shutdown()
+		if _, ok := a.delegate.(*consul.Server); ok {
+			a.logger.Print("[INFO] agent: consul server down")
+		} else {
+			a.logger.Print("[INFO] agent: consul client down")
+		}
 	}
 
 	pidErr := a.deletePid()
@@ -858,6 +1128,18 @@ func (a *Agent) Shutdown() error {
 	return err
 }
 
+// ReloadCh is used to return a channel that can be
+// used for triggering reloads and returning a response.
+func (a *Agent) ReloadCh() chan chan error {
+	return a.reloadCh
+}
+
+// RetryJoinCh is a channel that transports errors
+// from the retry join process.
+func (a *Agent) RetryJoinCh() <-chan error {
+	return a.retryJoinCh
+}
+
 // ShutdownCh is used to return a channel that can be
 // selected to wait for the agent to perform a shutdown.
 func (a *Agent) ShutdownCh() <-chan struct{} {
@@ -867,11 +1149,7 @@ func (a *Agent) ShutdownCh() <-chan struct{} {
 // JoinLAN is used to have the agent join a LAN cluster
 func (a *Agent) JoinLAN(addrs []string) (n int, err error) {
 	a.logger.Printf("[INFO] agent: (LAN) joining: %v", addrs)
-	if a.server != nil {
-		n, err = a.server.JoinLAN(addrs)
-	} else {
-		n, err = a.client.JoinLAN(addrs)
-	}
+	n, err = a.delegate.JoinLAN(addrs)
 	a.logger.Printf("[INFO] agent: (LAN) joined: %d Err: %v", n, err)
 	return
 }
@@ -879,8 +1157,8 @@ func (a *Agent) JoinLAN(addrs []string) (n int, err error) {
 // JoinWAN is used to have the agent join a WAN cluster
 func (a *Agent) JoinWAN(addrs []string) (n int, err error) {
 	a.logger.Printf("[INFO] agent: (WAN) joining: %v", addrs)
-	if a.server != nil {
-		n, err = a.server.JoinWAN(addrs)
+	if srv, ok := a.delegate.(*consul.Server); ok {
+		n, err = srv.JoinWAN(addrs)
 	} else {
 		err = fmt.Errorf("Must be a server to join WAN cluster")
 	}
@@ -891,11 +1169,7 @@ func (a *Agent) JoinWAN(addrs []string) (n int, err error) {
 // ForceLeave is used to remove a failed node from the cluster
 func (a *Agent) ForceLeave(node string) (err error) {
 	a.logger.Printf("[INFO] Force leaving node: %v", node)
-	if a.server != nil {
-		err = a.server.RemoveFailedNode(node)
-	} else {
-		err = a.client.RemoveFailedNode(node)
-	}
+	err = a.delegate.RemoveFailedNode(node)
 	if err != nil {
 		a.logger.Printf("[WARN] Failed to remove node: %v", err)
 	}
@@ -904,24 +1178,18 @@ func (a *Agent) ForceLeave(node string) (err error) {
 
 // LocalMember is used to return the local node
 func (a *Agent) LocalMember() serf.Member {
-	if a.server != nil {
-		return a.server.LocalMember()
-	}
-	return a.client.LocalMember()
+	return a.delegate.LocalMember()
 }
 
 // LANMembers is used to retrieve the LAN members
 func (a *Agent) LANMembers() []serf.Member {
-	if a.server != nil {
-		return a.server.LANMembers()
-	}
-	return a.client.LANMembers()
+	return a.delegate.LANMembers()
 }
 
 // WANMembers is used to retrieve the WAN members
 func (a *Agent) WANMembers() []serf.Member {
-	if a.server != nil {
-		return a.server.WANMembers()
+	if srv, ok := a.delegate.(*consul.Server); ok {
+		return srv.WANMembers()
 	}
 	return nil
 }
@@ -943,13 +1211,10 @@ func (a *Agent) ResumeSync() {
 	a.state.Resume()
 }
 
-// Returns the coordinate of this node in the local pool (assumes coordinates
+// GetLANCoordinate returns the coordinate of this node in the local pool (assumes coordinates
 // are enabled, so check that before calling).
-func (a *Agent) GetCoordinate() (*coordinate.Coordinate, error) {
-	if a.config.Server {
-		return a.server.GetLANCoordinate()
-	}
-	return a.client.GetCoordinate()
+func (a *Agent) GetLANCoordinate() (*coordinate.Coordinate, error) {
+	return a.delegate.GetLANCoordinate()
 }
 
 // sendCoordinate is a long-running loop that periodically sends our coordinate
@@ -974,7 +1239,7 @@ func (a *Agent) sendCoordinate() {
 				continue
 			}
 
-			c, err := a.GetCoordinate()
+			c, err := a.GetLANCoordinate()
 			if err != nil {
 				a.logger.Printf("[ERR] agent: failed to get coordinate: %s", err)
 				continue
@@ -1178,14 +1443,21 @@ func (a *Agent) AddService(service *structs.NodeService, chkTypes CheckTypes, pe
 
 	// Create an associated health check
 	for i, chkType := range chkTypes {
-		checkID := fmt.Sprintf("service:%s", service.ID)
-		if len(chkTypes) > 1 {
-			checkID += fmt.Sprintf(":%d", i+1)
+		checkID := string(chkType.CheckID)
+		if checkID == "" {
+			checkID = fmt.Sprintf("service:%s", service.ID)
+			if len(chkTypes) > 1 {
+				checkID += fmt.Sprintf(":%d", i+1)
+			}
+		}
+		name := chkType.Name
+		if name == "" {
+			name = fmt.Sprintf("Service '%s' check", service.Service)
 		}
 		check := &structs.HealthCheck{
 			Node:        a.config.NodeName,
 			CheckID:     types.CheckID(checkID),
-			Name:        fmt.Sprintf("Service '%s' check", service.Service),
+			Name:        name,
 			Status:      api.HealthCritical,
 			Notes:       chkType.Notes,
 			ServiceID:   service.ID,
@@ -1205,7 +1477,7 @@ func (a *Agent) AddService(service *structs.NodeService, chkTypes CheckTypes, pe
 // The agent will make a best effort to ensure it is deregistered
 func (a *Agent) RemoveService(serviceID string, persist bool) error {
 	// Protect "consul" service from deletion by a user
-	if a.server != nil && serviceID == consul.ConsulServiceID {
+	if _, ok := a.delegate.(*consul.Server); ok && serviceID == consul.ConsulServiceID {
 		return fmt.Errorf(
 			"Deregistering the %s service is not allowed",
 			consul.ConsulServiceID)
@@ -1444,7 +1716,7 @@ func (a *Agent) RemoveCheck(checkID types.CheckID, persist bool) error {
 			return err
 		}
 	}
-	log.Printf("[DEBUG] agent: removed check %q", checkID)
+	a.logger.Printf("[DEBUG] agent: removed check %q", checkID)
 	return nil
 }
 
@@ -1558,17 +1830,16 @@ func (a *Agent) purgeCheckState(checkID types.CheckID) error {
 	return err
 }
 
+func (a *Agent) GossipEncrypted() bool {
+	return a.delegate.Encrypted()
+}
+
 // Stats is used to get various debugging state from the sub-systems
 func (a *Agent) Stats() map[string]map[string]string {
 	toString := func(v uint64) string {
 		return strconv.FormatUint(v, 10)
 	}
-	var stats map[string]map[string]string
-	if a.server != nil {
-		stats = a.server.Stats()
-	} else {
-		stats = a.client.Stats()
-	}
+	stats := a.delegate.Stats()
 	stats["agent"] = map[string]string{
 		"check_monitors": toString(uint64(len(a.checkMonitors))),
 		"check_ttls":     toString(uint64(len(a.checkTTLs))),
@@ -1728,7 +1999,7 @@ func (a *Agent) loadChecks(conf *Config) error {
 	// Register the checks from config
 	for _, check := range conf.Checks {
 		health := check.HealthCheck(conf.NodeName)
-		chkType := &check.CheckType
+		chkType := check.CheckType()
 		if err := a.AddCheck(health, chkType, false, check.Token); err != nil {
 			return fmt.Errorf("Failed to register check '%s': %v %v", check.Name, err, check)
 		}
@@ -1841,15 +2112,6 @@ func (a *Agent) loadMetadata(conf *Config) error {
 	return nil
 }
 
-// parseMetaPair parses a key/value pair of the form key:value
-func parseMetaPair(raw string) (string, string) {
-	pair := strings.SplitN(raw, ":", 2)
-	if len(pair) == 2 {
-		return pair[0], pair[1]
-	}
-	return pair[0], ""
-}
-
 // unloadMetadata resets the local metadata state
 func (a *Agent) unloadMetadata() {
 	a.state.Lock()
@@ -1955,15 +2217,17 @@ func (a *Agent) DisableNodeMaintenance() {
 // that not all agent methods use this mechanism, and that is should only
 // be used for testing.
 func (a *Agent) InjectEndpoint(endpoint string, handler interface{}) error {
-	if a.server == nil {
+	srv, ok := a.delegate.(*consul.Server)
+	if !ok {
 		return fmt.Errorf("agent must be a server")
 	}
-
-	if err := a.server.InjectEndpoint(handler); err != nil {
+	if err := srv.InjectEndpoint(handler); err != nil {
 		return err
 	}
 	name := reflect.Indirect(reflect.ValueOf(handler)).Type().Name()
+	a.endpointsLock.Lock()
 	a.endpoints[endpoint] = name
+	a.endpointsLock.Unlock()
 
 	a.logger.Printf("[WARN] agent: endpoint injected; this should only be used for testing")
 	return nil
@@ -1972,8 +2236,72 @@ func (a *Agent) InjectEndpoint(endpoint string, handler interface{}) error {
 // getEndpoint returns the endpoint name to use for the given endpoint,
 // which may be overridden.
 func (a *Agent) getEndpoint(endpoint string) string {
+	a.endpointsLock.RLock()
+	defer a.endpointsLock.RUnlock()
 	if override, ok := a.endpoints[endpoint]; ok {
 		return override
 	}
 	return endpoint
+}
+
+func (a *Agent) ReloadConfig(newCfg *Config) (bool, error) {
+	var errs error
+
+	// Bulk update the services and checks
+	a.PauseSync()
+	defer a.ResumeSync()
+
+	// Snapshot the current state, and restore it afterwards
+	snap := a.snapshotCheckState()
+	defer a.restoreCheckState(snap)
+
+	// First unload all checks, services, and metadata. This lets us begin the reload
+	// with a clean slate.
+	if err := a.unloadServices(); err != nil {
+		errs = multierror.Append(errs, fmt.Errorf("Failed unloading services: %s", err))
+		return false, errs
+	}
+	if err := a.unloadChecks(); err != nil {
+		errs = multierror.Append(errs, fmt.Errorf("Failed unloading checks: %s", err))
+		return false, errs
+	}
+	a.unloadMetadata()
+
+	// Reload service/check definitions and metadata.
+	if err := a.loadServices(newCfg); err != nil {
+		errs = multierror.Append(errs, fmt.Errorf("Failed reloading services: %s", err))
+		return false, errs
+	}
+	if err := a.loadChecks(newCfg); err != nil {
+		errs = multierror.Append(errs, fmt.Errorf("Failed reloading checks: %s", err))
+		return false, errs
+	}
+	if err := a.loadMetadata(newCfg); err != nil {
+		errs = multierror.Append(errs, fmt.Errorf("Failed reloading metadata: %s", err))
+		return false, errs
+	}
+
+	// Get the new client listener addr
+	httpAddr, err := newCfg.ClientListener(a.config.Addresses.HTTP, a.config.Ports.HTTP)
+	if err != nil {
+		errs = multierror.Append(errs, fmt.Errorf("Failed to determine HTTP address: %v", err))
+	}
+
+	// Deregister the old watches
+	for _, wp := range a.config.WatchPlans {
+		wp.Stop()
+	}
+
+	// Register the new watches
+	for _, wp := range newCfg.WatchPlans {
+		go func(wp *watch.Plan) {
+			wp.Handler = makeWatchHandler(a.LogOutput, wp.Exempt["handler"])
+			wp.LogOutput = a.LogOutput
+			if err := wp.Run(httpAddr.String()); err != nil {
+				errs = multierror.Append(errs, fmt.Errorf("Error running watch: %v", err))
+			}
+		}(wp)
+	}
+
+	return true, errs
 }

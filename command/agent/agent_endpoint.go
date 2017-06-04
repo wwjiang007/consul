@@ -9,6 +9,7 @@ import (
 
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/consul/ipaddr"
 	"github.com/hashicorp/consul/logger"
 	"github.com/hashicorp/consul/types"
 	"github.com/hashicorp/logutils"
@@ -28,7 +29,7 @@ func (s *HTTPServer) AgentSelf(resp http.ResponseWriter, req *http.Request) (int
 	var c *coordinate.Coordinate
 	if !s.agent.config.DisableCoordinates {
 		var err error
-		if c, err = s.agent.GetCoordinate(); err != nil {
+		if c, err = s.agent.GetLANCoordinate(); err != nil {
 			return nil, err
 		}
 	}
@@ -73,14 +74,14 @@ func (s *HTTPServer) AgentReload(resp http.ResponseWriter, req *http.Request) (i
 	// Trigger the reload
 	errCh := make(chan error, 0)
 	select {
-	case <-s.agent.ShutdownCh():
+	case <-s.agent.shutdownCh:
 		return nil, fmt.Errorf("Agent was shutdown before reload could be completed")
 	case s.agent.reloadCh <- errCh:
 	}
 
 	// Wait for the result of the reload, or for the agent to shutdown
 	select {
-	case <-s.agent.ShutdownCh():
+	case <-s.agent.shutdownCh:
 		return nil, fmt.Errorf("Agent was shutdown before reload could be completed")
 	case err := <-errCh:
 		return nil, err
@@ -222,7 +223,7 @@ func (s *HTTPServer) AgentForceLeave(resp http.ResponseWriter, req *http.Request
 // only warn because the write did succeed and anti-entropy will sync later.
 func (s *HTTPServer) syncChanges() {
 	if err := s.agent.state.syncChanges(); err != nil {
-		s.logger.Printf("[ERR] agent: failed to sync changes: %v", err)
+		s.agent.logger.Printf("[ERR] agent: failed to sync changes: %v", err)
 	}
 }
 
@@ -257,7 +258,7 @@ func (s *HTTPServer) AgentRegisterCheck(resp http.ResponseWriter, req *http.Requ
 	health := args.HealthCheck(s.agent.config.NodeName)
 
 	// Verify the check type.
-	chkType := &args.CheckType
+	chkType := args.CheckType()
 	if !chkType.Valid() {
 		resp.WriteHeader(400)
 		fmt.Fprint(resp, invalidCheckMessage)
@@ -454,7 +455,7 @@ func (s *HTTPServer) AgentRegisterService(resp http.ResponseWriter, req *http.Re
 
 	// Check the service address here and in the catalog RPC endpoint
 	// since service registration isn't sychronous.
-	if args.Address == "0.0.0.0" || args.Address == "::" || args.Address == "[::]" {
+	if ipaddr.IsAny(args.Address) {
 		resp.WriteHeader(400)
 		fmt.Fprintf(resp, "Invalid service address")
 		return nil, nil
@@ -653,17 +654,17 @@ func (s *HTTPServer) AgentMonitor(resp http.ResponseWriter, req *http.Request) (
 	handler := &httpLogHandler{
 		filter: filter,
 		logCh:  make(chan string, 512),
-		logger: s.logger,
+		logger: s.agent.logger,
 	}
-	s.agent.logWriter.RegisterHandler(handler)
-	defer s.agent.logWriter.DeregisterHandler(handler)
+	s.agent.LogWriter.RegisterHandler(handler)
+	defer s.agent.LogWriter.DeregisterHandler(handler)
 	notify := resp.(http.CloseNotifier).CloseNotify()
 
 	// Stream logs until the connection is closed.
 	for {
 		select {
 		case <-notify:
-			s.agent.logWriter.DeregisterHandler(handler)
+			s.agent.LogWriter.DeregisterHandler(handler)
 			if handler.droppedCount > 0 {
 				s.agent.logger.Printf("[WARN] agent: Dropped %d logs during monitor request", handler.droppedCount)
 			}

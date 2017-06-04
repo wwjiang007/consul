@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -163,6 +164,19 @@ type RetryJoinGCE struct {
 	// 3. On Google Compute Engine, it fetches credentials from the metadata
 	//    server.  (In this final case any provided scopes are ignored.)
 	CredentialsFile string `mapstructure:"credentials_file"`
+}
+
+// RetryJoinAzure is used to configure discovery of instances via AzureRM API
+type RetryJoinAzure struct {
+	// The tag name and value to use when filtering instances
+	TagName  string `mapstructure:"tag_name"`
+	TagValue string `mapstructure:"tag_value"`
+
+	// The Azure credentials to use for making requests to AzureRM
+	SubscriptionID  string `mapstructure:"subscription_id" json:"-"`
+	TenantID        string `mapstructure:"tenant_id" json:"-"`
+	ClientID        string `mapstructure:"client_id" json:"-"`
+	SecretAccessKey string `mapstructure:"secret_access_key" json:"-"`
 }
 
 // Performance is used to tune the performance of Consul's subsystems.
@@ -352,6 +366,12 @@ type Config struct {
 	// Encryption key to use for the Serf communication
 	EncryptKey string `mapstructure:"encrypt" json:"-"`
 
+	// EncryptVerifyIncoming and EncryptVerifyOutgoing are used to enforce
+	// incoming/outgoing gossip encryption and can be used to upshift to
+	// encrypted gossip on a running cluster.
+	EncryptVerifyIncoming *bool `mapstructure:"encrypt_verify_incoming"`
+	EncryptVerifyOutgoing *bool `mapstructure:"encrypt_verify_outgoing"`
+
 	// LogLevel is the level of the logs to putout
 	LogLevel string `mapstructure:"log_level"`
 
@@ -531,11 +551,14 @@ type Config struct {
 	RetryInterval    time.Duration `mapstructure:"-" json:"-"`
 	RetryIntervalRaw string        `mapstructure:"retry_interval"`
 
-	// RetryJoinEC2 configuration
+	// RetryJoinEC2 specifies the configuration for auto-join on EC2.
 	RetryJoinEC2 RetryJoinEC2 `mapstructure:"retry_join_ec2"`
 
-	// The config struct for the GCE tag server discovery feature.
+	// RetryJoinGCE specifies the configuration for auto-join on GCE.
 	RetryJoinGCE RetryJoinGCE `mapstructure:"retry_join_gce"`
+
+	// RetryJoinAzure specifies the configuration for auto-join on Azure.
+	RetryJoinAzure RetryJoinAzure `mapstructure:"retry_join_azure"`
 
 	// RetryJoinWan is a list of addresses to join -wan with retry enabled.
 	RetryJoinWan []string `mapstructure:"retry_join_wan"`
@@ -738,6 +761,70 @@ type Config struct {
 	DeprecatedAtlasEndpoint       string `mapstructure:"atlas_endpoint" json:"-"`
 }
 
+// IncomingHTTPSConfig returns the TLS configuration for HTTPS
+// connections to consul.
+func (c *Config) IncomingHTTPSConfig() (*tls.Config, error) {
+	tc := &tlsutil.Config{
+		VerifyIncoming:           c.VerifyIncoming || c.VerifyIncomingHTTPS,
+		VerifyOutgoing:           c.VerifyOutgoing,
+		CAFile:                   c.CAFile,
+		CAPath:                   c.CAPath,
+		CertFile:                 c.CertFile,
+		KeyFile:                  c.KeyFile,
+		NodeName:                 c.NodeName,
+		ServerName:               c.ServerName,
+		TLSMinVersion:            c.TLSMinVersion,
+		CipherSuites:             c.TLSCipherSuites,
+		PreferServerCipherSuites: c.TLSPreferServerCipherSuites,
+	}
+	return tc.IncomingTLSConfig()
+}
+
+type ProtoAddr struct {
+	Proto, Net, Addr string
+}
+
+func (p ProtoAddr) String() string {
+	return p.Proto + "+" + p.Net + "://" + p.Addr
+}
+
+func (c *Config) DNSAddrs() ([]ProtoAddr, error) {
+	if c.Ports.DNS == 0 {
+		return nil, nil
+	}
+	a, err := c.ClientListener(c.Addresses.DNS, c.Ports.DNS)
+	if err != nil {
+		return nil, err
+	}
+	addrs := []ProtoAddr{
+		{"dns", "tcp", a.String()},
+		{"dns", "udp", a.String()},
+	}
+	return addrs, nil
+}
+
+// HTTPAddrs returns the bind addresses for the HTTP server and
+// the application protocol which should be served, e.g. 'http'
+// or 'https'.
+func (c *Config) HTTPAddrs() ([]ProtoAddr, error) {
+	var addrs []ProtoAddr
+	if c.Ports.HTTP > 0 {
+		a, err := c.ClientListener(c.Addresses.HTTP, c.Ports.HTTP)
+		if err != nil {
+			return nil, err
+		}
+		addrs = append(addrs, ProtoAddr{"http", a.Network(), a.String()})
+	}
+	if c.Ports.HTTPS > 0 && c.CertFile != "" && c.KeyFile != "" {
+		a, err := c.ClientListener(c.Addresses.HTTPS, c.Ports.HTTPS)
+		if err != nil {
+			return nil, err
+		}
+		addrs = append(addrs, ProtoAddr{"https", a.Network(), a.String()})
+	}
+	return addrs, nil
+}
+
 // Bool is used to initialize bool pointers in struct literals.
 func Bool(b bool) *bool {
 	return &b
@@ -783,13 +870,13 @@ type UnixSocketConfig struct {
 	UnixSocketPermissions `mapstructure:",squash"`
 }
 
-// unixSocketAddr tests if a given address describes a domain socket,
+// socketPath tests if a given address describes a domain socket,
 // and returns the relevant path part of the string if it is.
-func unixSocketAddr(addr string) (string, bool) {
+func socketPath(addr string) string {
 	if !strings.HasPrefix(addr, "unix://") {
-		return "", false
+		return ""
 	}
-	return strings.TrimPrefix(addr, "unix://"), true
+	return strings.TrimPrefix(addr, "unix://")
 }
 
 type dirEnts []os.FileInfo
@@ -848,6 +935,9 @@ func DefaultConfig() *Config {
 		RetryIntervalWan:   30 * time.Second,
 
 		TLSMinVersion: "tls10",
+
+		EncryptVerifyIncoming: Bool(true),
+		EncryptVerifyOutgoing: Bool(true),
 	}
 }
 
@@ -889,14 +979,11 @@ func (c *Config) EncryptBytes() ([]byte, error) {
 // ClientListener is used to format a listener for a
 // port on a ClientAddr
 func (c *Config) ClientListener(override string, port int) (net.Addr, error) {
-	var addr string
+	addr := c.ClientAddr
 	if override != "" {
 		addr = override
-	} else {
-		addr = c.ClientAddr
 	}
-
-	if path, ok := unixSocketAddr(addr); ok {
+	if path := socketPath(addr); path != "" {
 		return &net.UnixAddr{Name: path, Net: "unix"}, nil
 	}
 	ip := net.ParseIP(addr)
@@ -1461,6 +1548,12 @@ func MergeConfig(a, b *Config) *Config {
 	if b.EncryptKey != "" {
 		result.EncryptKey = b.EncryptKey
 	}
+	if b.EncryptVerifyIncoming != nil {
+		result.EncryptVerifyIncoming = b.EncryptVerifyIncoming
+	}
+	if b.EncryptVerifyOutgoing != nil {
+		result.EncryptVerifyOutgoing = b.EncryptVerifyOutgoing
+	}
 	if b.LogLevel != "" {
 		result.LogLevel = b.LogLevel
 	}
@@ -1728,6 +1821,24 @@ func MergeConfig(a, b *Config) *Config {
 	if b.RetryJoinGCE.CredentialsFile != "" {
 		result.RetryJoinGCE.CredentialsFile = b.RetryJoinGCE.CredentialsFile
 	}
+	if b.RetryJoinAzure.TagName != "" {
+		result.RetryJoinAzure.TagName = b.RetryJoinAzure.TagName
+	}
+	if b.RetryJoinAzure.TagValue != "" {
+		result.RetryJoinAzure.TagValue = b.RetryJoinAzure.TagValue
+	}
+	if b.RetryJoinAzure.SubscriptionID != "" {
+		result.RetryJoinAzure.SubscriptionID = b.RetryJoinAzure.SubscriptionID
+	}
+	if b.RetryJoinAzure.TenantID != "" {
+		result.RetryJoinAzure.TenantID = b.RetryJoinAzure.TenantID
+	}
+	if b.RetryJoinAzure.ClientID != "" {
+		result.RetryJoinAzure.ClientID = b.RetryJoinAzure.ClientID
+	}
+	if b.RetryJoinAzure.SecretAccessKey != "" {
+		result.RetryJoinAzure.SecretAccessKey = b.RetryJoinAzure.SecretAccessKey
+	}
 	if b.RetryMaxAttemptsWan != 0 {
 		result.RetryMaxAttemptsWan = b.RetryMaxAttemptsWan
 	}
@@ -1969,22 +2080,11 @@ func (d dirEnts) Swap(i, j int) {
 	d[i], d[j] = d[j], d[i]
 }
 
-// isAddrANY checks if the given ip address is an IPv4 or IPv6 ANY address. ip
-// can be either a *net.IP or a string. It panics on another type.
-func isAddrANY(ip interface{}) bool {
-	if ip == nil {
-		return false
+// ParseMetaPair parses a key/value pair of the form key:value
+func ParseMetaPair(raw string) (string, string) {
+	pair := strings.SplitN(raw, ":", 2)
+	if len(pair) == 2 {
+		return pair[0], pair[1]
 	}
-	var ips string
-	switch x := ip.(type) {
-	case net.IP:
-		ips = x.String()
-	case *net.IP:
-		ips = x.String()
-	case string:
-		ips = x
-	default:
-		panic(fmt.Sprintf("invalid type: %T", ip))
-	}
-	return ips == "0.0.0.0" || ips == "::" || ips == "[::]"
+	return pair[0], ""
 }

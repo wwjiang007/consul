@@ -6,12 +6,13 @@ import (
 	"testing"
 
 	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/command/agent"
 	"github.com/hashicorp/consul/command/base"
 	"github.com/mitchellh/cli"
 )
 
 func testKVDeleteCommand(t *testing.T) (*cli.MockUi, *KVDeleteCommand) {
-	ui := new(cli.MockUi)
+	ui := cli.NewMockUi()
 	return ui, &KVDeleteCommand{
 		Command: base.Command{
 			UI:    ui,
@@ -21,14 +22,17 @@ func testKVDeleteCommand(t *testing.T) (*cli.MockUi, *KVDeleteCommand) {
 }
 
 func TestKVDeleteCommand_implements(t *testing.T) {
+	t.Parallel()
 	var _ cli.Command = &KVDeleteCommand{}
 }
 
 func TestKVDeleteCommand_noTabs(t *testing.T) {
+	t.Parallel()
 	assertNoTabs(t, new(KVDeleteCommand))
 }
 
 func TestKVDeleteCommand_Validation(t *testing.T) {
+	t.Parallel()
 	ui, c := testKVDeleteCommand(t)
 
 	cases := map[string]struct {
@@ -79,9 +83,10 @@ func TestKVDeleteCommand_Validation(t *testing.T) {
 }
 
 func TestKVDeleteCommand_Run(t *testing.T) {
-	srv, client := testAgentWithAPIClient(t)
-	defer srv.Shutdown()
-	waitForLeader(t, srv.httpAddr)
+	t.Parallel()
+	a := agent.NewTestAgent(t.Name(), nil)
+	defer a.Shutdown()
+	client := a.Client()
 
 	ui, c := testKVDeleteCommand(t)
 
@@ -95,7 +100,7 @@ func TestKVDeleteCommand_Run(t *testing.T) {
 	}
 
 	args := []string{
-		"-http-addr=" + srv.httpAddr,
+		"-http-addr=" + a.HTTPAddr(),
 		"foo",
 	}
 
@@ -114,9 +119,10 @@ func TestKVDeleteCommand_Run(t *testing.T) {
 }
 
 func TestKVDeleteCommand_Recurse(t *testing.T) {
-	srv, client := testAgentWithAPIClient(t)
-	defer srv.Shutdown()
-	waitForLeader(t, srv.httpAddr)
+	t.Parallel()
+	a := agent.NewTestAgent(t.Name(), nil)
+	defer a.Shutdown()
+	client := a.Client()
 
 	ui, c := testKVDeleteCommand(t)
 
@@ -134,7 +140,7 @@ func TestKVDeleteCommand_Recurse(t *testing.T) {
 	}
 
 	args := []string{
-		"-http-addr=" + srv.httpAddr,
+		"-http-addr=" + a.HTTPAddr(),
 		"-recurse",
 		"foo",
 	}
@@ -156,9 +162,10 @@ func TestKVDeleteCommand_Recurse(t *testing.T) {
 }
 
 func TestKVDeleteCommand_CAS(t *testing.T) {
-	srv, client := testAgentWithAPIClient(t)
-	defer srv.Shutdown()
-	waitForLeader(t, srv.httpAddr)
+	t.Parallel()
+	a := agent.NewTestAgent(t.Name(), nil)
+	defer a.Shutdown()
+	client := a.Client()
 
 	ui, c := testKVDeleteCommand(t)
 
@@ -172,7 +179,7 @@ func TestKVDeleteCommand_CAS(t *testing.T) {
 	}
 
 	args := []string{
-		"-http-addr=" + srv.httpAddr,
+		"-http-addr=" + a.HTTPAddr(),
 		"-cas",
 		"-modify-index", "1",
 		"foo",
@@ -193,7 +200,7 @@ func TestKVDeleteCommand_CAS(t *testing.T) {
 	ui.ErrorWriter.Reset()
 
 	args = []string{
-		"-http-addr=" + srv.httpAddr,
+		"-http-addr=" + a.HTTPAddr(),
 		"-cas",
 		"-modify-index", strconv.FormatUint(data.ModifyIndex, 10),
 		"foo",

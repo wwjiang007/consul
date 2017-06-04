@@ -15,9 +15,11 @@ import (
 
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/testutil"
+	"github.com/pascaldekloe/goe/verify"
 )
 
 func TestConfigEncryptBytes(t *testing.T) {
+	t.Parallel()
 	// Test with some input
 	src := []byte("abc")
 	c := &Config{
@@ -46,6 +48,7 @@ func TestConfigEncryptBytes(t *testing.T) {
 }
 
 func TestDecodeConfig(t *testing.T) {
+	t.Parallel()
 	// Basics
 	input := `{"data_dir": "/tmp/", "log_level": "debug"}`
 	config, err := DecodeConfig(bytes.NewReader([]byte(input)))
@@ -119,6 +122,18 @@ func TestDecodeConfig(t *testing.T) {
 	}
 
 	if config.BootstrapExpect != 3 {
+		t.Fatalf("bad: %#v", config)
+	}
+
+	input = `{"encrypt_verify_incoming":true, "encrypt_verify_outgoing":true}`
+	config, err = DecodeConfig(bytes.NewReader([]byte(input)))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if config.EncryptVerifyIncoming == nil || !*config.EncryptVerifyIncoming {
+		t.Fatalf("bad: %#v", config)
+	}
+	if config.EncryptVerifyOutgoing == nil || !*config.EncryptVerifyOutgoing {
 		t.Fatalf("bad: %#v", config)
 	}
 
@@ -1060,6 +1075,7 @@ func TestDecodeConfig(t *testing.T) {
 }
 
 func TestDecodeConfig_invalidKeys(t *testing.T) {
+	t.Parallel()
 	input := `{"bad": "no way jose"}`
 	_, err := DecodeConfig(bytes.NewReader([]byte(input)))
 	if err == nil || !strings.Contains(err.Error(), "invalid keys") {
@@ -1068,6 +1084,7 @@ func TestDecodeConfig_invalidKeys(t *testing.T) {
 }
 
 func TestRetryJoinEC2(t *testing.T) {
+	t.Parallel()
 	input := `{"retry_join_ec2": {
 	  "region": "us-east-1",
 		"tag_key": "ConsulRole",
@@ -1098,6 +1115,7 @@ func TestRetryJoinEC2(t *testing.T) {
 }
 
 func TestRetryJoinGCE(t *testing.T) {
+	t.Parallel()
 	input := `{"retry_join_gce": {
 	  "project_name": "test-project",
 		"zone_pattern": "us-west1-a",
@@ -1123,7 +1141,49 @@ func TestRetryJoinGCE(t *testing.T) {
 	}
 }
 
+func TestRetryJoinAzure(t *testing.T) {
+	input := `{
+	"retry_join_azure": {
+		"tag_name": "type",
+		"tag_value": "Foundation",
+		"subscription_id": "klm-no",
+		"tenant_id": "fgh-ij",
+		"client_id": "abc-de",
+		"secret_access_key": "qwerty"
+	}}`
+
+	config, err := DecodeConfig(bytes.NewReader([]byte(input)))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if config.RetryJoinAzure.TagName != "type" {
+		t.Fatalf("bad: %#v", config)
+	}
+
+	if config.RetryJoinAzure.TagValue != "Foundation" {
+		t.Fatalf("bad: %#v", config)
+	}
+
+	if config.RetryJoinAzure.SubscriptionID != "klm-no" {
+		t.Fatalf("bad: %#v", config)
+	}
+
+	if config.RetryJoinAzure.TenantID != "fgh-ij" {
+		t.Fatalf("bad: %#v", config)
+	}
+
+	if config.RetryJoinAzure.ClientID != "abc-de" {
+		t.Fatalf("bad: %#v", config)
+	}
+
+	if config.RetryJoinAzure.SecretAccessKey != "qwerty" {
+		t.Fatalf("bad: %#v", config)
+	}
+}
+
 func TestDecodeConfig_Performance(t *testing.T) {
+	t.Parallel()
 	input := `{"performance": { "raft_multiplier": 3 }}`
 	config, err := DecodeConfig(bytes.NewReader([]byte(input)))
 	if err != nil {
@@ -1141,6 +1201,7 @@ func TestDecodeConfig_Performance(t *testing.T) {
 }
 
 func TestDecodeConfig_Autopilot(t *testing.T) {
+	t.Parallel()
 	input := `{"autopilot": {
 	  "cleanup_dead_servers": true,
 	  "last_contact_threshold": "100ms",
@@ -1174,6 +1235,7 @@ func TestDecodeConfig_Autopilot(t *testing.T) {
 }
 
 func TestDecodeConfig_Services(t *testing.T) {
+	t.Parallel()
 	input := `{
 		"services": [
 			{
@@ -1289,6 +1351,7 @@ func TestDecodeConfig_Services(t *testing.T) {
 }
 
 func TestDecodeConfig_verifyUniqueListeners(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		cfg  string
@@ -1320,17 +1383,18 @@ func TestDecodeConfig_verifyUniqueListeners(t *testing.T) {
 }
 
 func TestDecodeConfig_Checks(t *testing.T) {
+	t.Parallel()
 	input := `{
 		"checks": [
 			{
 				"id": "chk1",
-				"name": "mem",
+				"name": "name1",
 				"script": "/bin/check_mem",
 				"interval": "5s"
 			},
 			{
 				"id": "chk2",
-				"name": "cpu",
+				"name": "name2",
 				"script": "/bin/check_cpu",
 				"interval": "10s"
 			},
@@ -1369,79 +1433,65 @@ func TestDecodeConfig_Checks(t *testing.T) {
 		]
 	}`
 
-	config, err := DecodeConfig(bytes.NewReader([]byte(input)))
+	got, err := DecodeConfig(bytes.NewReader([]byte(input)))
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
-	expected := &Config{
+	want := &Config{
 		Checks: []*CheckDefinition{
 			&CheckDefinition{
-				ID:   "chk1",
-				Name: "mem",
-				CheckType: CheckType{
-					Script:   "/bin/check_mem",
-					Interval: 5 * time.Second,
-				},
+				ID:       "chk1",
+				Name:     "name1",
+				Script:   "/bin/check_mem",
+				Interval: 5 * time.Second,
 			},
 			&CheckDefinition{
-				ID:   "chk2",
-				Name: "cpu",
-				CheckType: CheckType{
-					Script:   "/bin/check_cpu",
-					Interval: 10 * time.Second,
-				},
+				ID:       "chk2",
+				Name:     "name2",
+				Script:   "/bin/check_cpu",
+				Interval: 10 * time.Second,
 			},
 			&CheckDefinition{
 				ID:        "chk3",
 				Name:      "service:redis:tx",
 				ServiceID: "redis",
-				CheckType: CheckType{
-					Script:   "/bin/check_redis_tx",
-					Interval: time.Minute,
-				},
+				Script:    "/bin/check_redis_tx",
+				Interval:  time.Minute,
 			},
 			&CheckDefinition{
 				ID:        "chk4",
 				Name:      "service:elasticsearch:health",
 				ServiceID: "elasticsearch",
-				CheckType: CheckType{
-					HTTP:     "http://localhost:9200/_cluster_health",
-					Interval: 10 * time.Second,
-					Timeout:  100 * time.Millisecond,
-				},
+				HTTP:      "http://localhost:9200/_cluster_health",
+				Interval:  10 * time.Second,
+				Timeout:   100 * time.Millisecond,
 			},
 			&CheckDefinition{
-				ID:        "chk5",
-				Name:      "service:sslservice",
-				ServiceID: "sslservice",
-				CheckType: CheckType{
-					HTTP:          "https://sslservice/status",
-					Interval:      10 * time.Second,
-					Timeout:       100 * time.Millisecond,
-					TLSSkipVerify: false,
-				},
+				ID:            "chk5",
+				Name:          "service:sslservice",
+				ServiceID:     "sslservice",
+				HTTP:          "https://sslservice/status",
+				Interval:      10 * time.Second,
+				Timeout:       100 * time.Millisecond,
+				TLSSkipVerify: false,
 			},
 			&CheckDefinition{
-				ID:        "chk6",
-				Name:      "service:insecure-sslservice",
-				ServiceID: "insecure-sslservice",
-				CheckType: CheckType{
-					HTTP:          "https://insecure-sslservice/status",
-					Interval:      10 * time.Second,
-					Timeout:       100 * time.Millisecond,
-					TLSSkipVerify: true,
-				},
+				ID:            "chk6",
+				Name:          "service:insecure-sslservice",
+				ServiceID:     "insecure-sslservice",
+				HTTP:          "https://insecure-sslservice/status",
+				Interval:      10 * time.Second,
+				Timeout:       100 * time.Millisecond,
+				TLSSkipVerify: true,
 			},
 		},
 	}
-
-	if !reflect.DeepEqual(config, expected) {
-		t.Fatalf("bad: %#v", config)
-	}
+	verify.Values(t, "", got, want)
 }
 
 func TestDecodeConfig_Multiples(t *testing.T) {
+	t.Parallel()
 	input := `{
 		"services": [
 			{
@@ -1452,6 +1502,8 @@ func TestDecodeConfig_Multiples(t *testing.T) {
 				],
 				"port": 6000,
 				"check": {
+					"checkID": "chk1",
+					"name": "name1",
 					"script": "/bin/check_redis -p 6000",
 					"interval": "5s",
 					"ttl": "20s"
@@ -1460,23 +1512,25 @@ func TestDecodeConfig_Multiples(t *testing.T) {
 		],
 		"checks": [
 			{
-				"id": "chk1",
-				"name": "mem",
+				"id": "chk2",
+				"name": "name2",
 				"script": "/bin/check_mem",
 				"interval": "10s"
 			}
 		]
 	}`
 
-	config, err := DecodeConfig(bytes.NewReader([]byte(input)))
+	got, err := DecodeConfig(bytes.NewReader([]byte(input)))
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
-	expected := &Config{
+	want := &Config{
 		Services: []*ServiceDefinition{
 			&ServiceDefinition{
 				Check: CheckType{
+					CheckID:  "chk1",
+					Name:     "name1",
 					Interval: 5 * time.Second,
 					Script:   "/bin/check_redis -p 6000",
 					TTL:      20 * time.Second,
@@ -1491,22 +1545,19 @@ func TestDecodeConfig_Multiples(t *testing.T) {
 		},
 		Checks: []*CheckDefinition{
 			&CheckDefinition{
-				ID:   "chk1",
-				Name: "mem",
-				CheckType: CheckType{
-					Script:   "/bin/check_mem",
-					Interval: 10 * time.Second,
-				},
+				ID:       "chk2",
+				Name:     "name2",
+				Script:   "/bin/check_mem",
+				Interval: 10 * time.Second,
 			},
 		},
 	}
 
-	if !reflect.DeepEqual(config, expected) {
-		t.Fatalf("bad: %#v", config)
-	}
+	verify.Values(t, "", got, want)
 }
 
 func TestDecodeConfig_Service(t *testing.T) {
+	t.Parallel()
 	// Basics
 	input := `{"service": {"id": "red1", "name": "redis", "tags": ["master"], "port":8000, "check": {"script": "/bin/check_redis", "interval": "10s", "ttl": "15s", "DeregisterCriticalServiceAfter": "90m" }}}`
 	config, err := DecodeConfig(bytes.NewReader([]byte(input)))
@@ -1553,6 +1604,7 @@ func TestDecodeConfig_Service(t *testing.T) {
 }
 
 func TestDecodeConfig_Check(t *testing.T) {
+	t.Parallel()
 	// Basics
 	input := `{"check": {"id": "chk1", "name": "mem", "notes": "foobar", "script": "/bin/check_redis", "interval": "10s", "ttl": "15s", "shell": "/bin/bash", "docker_container_id": "redis", "deregister_critical_service_after": "90s" }}`
 	config, err := DecodeConfig(bytes.NewReader([]byte(input)))
@@ -1603,6 +1655,7 @@ func TestDecodeConfig_Check(t *testing.T) {
 }
 
 func TestMergeConfig(t *testing.T) {
+	t.Parallel()
 	a := &Config{
 		Bootstrap:              false,
 		BootstrapExpect:        0,
@@ -1791,6 +1844,7 @@ func TestMergeConfig(t *testing.T) {
 }
 
 func TestReadConfigPaths_badPath(t *testing.T) {
+	t.Parallel()
 	_, err := ReadConfigPaths([]string{"/i/shouldnt/exist/ever/rainbows"})
 	if err == nil {
 		t.Fatal("should have err")
@@ -1798,6 +1852,7 @@ func TestReadConfigPaths_badPath(t *testing.T) {
 }
 
 func TestReadConfigPaths_file(t *testing.T) {
+	t.Parallel()
 	tf := testutil.TempFile(t, "consul")
 	tf.Write([]byte(`{"node_name":"bar"}`))
 	tf.Close()
@@ -1814,6 +1869,7 @@ func TestReadConfigPaths_file(t *testing.T) {
 }
 
 func TestReadConfigPaths_dir(t *testing.T) {
+	t.Parallel()
 	td := testutil.TempDir(t, "consul")
 	defer os.RemoveAll(td)
 
@@ -1854,13 +1910,52 @@ func TestReadConfigPaths_dir(t *testing.T) {
 }
 
 func TestUnixSockets(t *testing.T) {
-	path1, ok := unixSocketAddr("unix:///path/to/socket")
-	if !ok || path1 != "/path/to/socket" {
-		t.Fatalf("bad: %v %v", ok, path1)
+	t.Parallel()
+	if p := socketPath("unix:///path/to/socket"); p != "/path/to/socket" {
+		t.Fatalf("bad: %q", p)
 	}
+	if p := socketPath("notunix://blah"); p != "" {
+		t.Fatalf("bad: %q", p)
+	}
+}
 
-	path2, ok := unixSocketAddr("notunix://blah")
-	if ok || path2 != "" {
-		t.Fatalf("bad: %v %v", ok, path2)
+func TestCheckDefinitionToCheckType(t *testing.T) {
+	t.Parallel()
+	got := &CheckDefinition{
+		ID:     "id",
+		Name:   "name",
+		Status: "green",
+		Notes:  "notes",
+
+		ServiceID:         "svcid",
+		Token:             "tok",
+		Script:            "/bin/foo",
+		HTTP:              "someurl",
+		TCP:               "host:port",
+		Interval:          1 * time.Second,
+		DockerContainerID: "abc123",
+		Shell:             "/bin/ksh",
+		TLSSkipVerify:     true,
+		Timeout:           2 * time.Second,
+		TTL:               3 * time.Second,
+		DeregisterCriticalServiceAfter: 4 * time.Second,
 	}
+	want := &CheckType{
+		CheckID: "id",
+		Name:    "name",
+		Status:  "green",
+		Notes:   "notes",
+
+		Script:            "/bin/foo",
+		HTTP:              "someurl",
+		TCP:               "host:port",
+		Interval:          1 * time.Second,
+		DockerContainerID: "abc123",
+		Shell:             "/bin/ksh",
+		TLSSkipVerify:     true,
+		Timeout:           2 * time.Second,
+		TTL:               3 * time.Second,
+		DeregisterCriticalServiceAfter: 4 * time.Second,
+	}
+	verify.Values(t, "", got.CheckType(), want)
 }

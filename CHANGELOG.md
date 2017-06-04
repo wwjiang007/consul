@@ -2,15 +2,28 @@
 
 FEATURES:
 
+* agent: Added `encrypt_verify_incoming` and `encrypt_verify_outgoing` options to use for upshifting to encrypted gossip on an existing cluster.
+* agent: Added a method for gracefully transitioning to TLS on an existing cluster. [GH-1705]
+* agent: Added support for RetryJoin on Azure [GH-2978]
+
 IMPROVEMENTS:
 
 * agent: Added a check which prevents advertising or setting a service to a zero address (`0.0.0.0`, `[::]`, `::`). [GH-2961]
-* agent: Added a method for gracefully transitioning to TLS on an existing cluster. [GH-1705]
+* agent: Allow binding to any public IPv6 address with `::` [GH-2285]
 * agent: Removed SCADA-related code for Atlas and deprecated all Atlas-related configuration options. [GH-3032]
+* agent: Added support for custom check id and name when registering checks along with a service. [GH-3047]
+* agent: Updated [go-sockaddr](https://github.com/hashicorp/go-sockaddr) library to add support for new helper functions in bind address templates (`GetPrivateIPs`, `GetPublicIPs`), new math functions, and to pick up fixes for issues with detecting addresses on multi-homed hosts. [GH-3068]
+* agent: Watches now reset their index back to zero after an error, or if the index goes backwards, which allows watches to recover after a server restart with fresh state. [GH-2621]
+* build: Added support for linux/arm64 binaries. [GH-3042]
+* build: Consul now builds with Go 1.8.3. [GH-3074]
+* ui: Added a sticky scroll to the KV side panel so the KV edit box always stays in place. [GH-2812]
 
 BUG FIXES:
 
+* agent: Added defensive code to prevent agents from infecting the network coordinates with `NaN` or `Inf` values, and added code to clean up in environments where this has happened. [GH-3023]
+* api: Added code to always read from the body of a request so that connections will always be returned to the pool. [GH-2850]
 * build: Added a vendor fix to allow compilation on Illumos. [GH-3024]
+* cli: Fixed an issue where `consul exec` would return a 0 exit code, even when there were nodes that didn't respond. [GH-2757]
 
 ## 0.8.3 (May 12, 2017)
 

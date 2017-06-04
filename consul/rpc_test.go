@@ -14,6 +14,7 @@ import (
 )
 
 func TestRPC_NoLeader_Fail(t *testing.T) {
+	t.Parallel()
 	dir1, s1 := testServerWithConfig(t, func(c *Config) {
 		c.RPCHoldTimeout = 1 * time.Millisecond
 	})
@@ -32,7 +33,7 @@ func TestRPC_NoLeader_Fail(t *testing.T) {
 	// Make sure we eventually fail with a no leader error, which we should
 	// see given the short timeout.
 	err := msgpackrpc.CallWithCodec(codec, "Catalog.Register", &arg, &out)
-	if err.Error() != structs.ErrNoLeader.Error() {
+	if err == nil || err.Error() != structs.ErrNoLeader.Error() {
 		t.Fatalf("bad: %v", err)
 	}
 
@@ -45,6 +46,7 @@ func TestRPC_NoLeader_Fail(t *testing.T) {
 }
 
 func TestRPC_NoLeader_Retry(t *testing.T) {
+	t.Parallel()
 	dir1, s1 := testServerWithConfig(t, func(c *Config) {
 		c.RPCHoldTimeout = 10 * time.Second
 	})
@@ -75,6 +77,7 @@ func TestRPC_NoLeader_Retry(t *testing.T) {
 }
 
 func TestRPC_blockingQuery(t *testing.T) {
+	t.Parallel()
 	dir, s := testServer(t)
 	defer os.RemoveAll(dir)
 	defer s.Shutdown()

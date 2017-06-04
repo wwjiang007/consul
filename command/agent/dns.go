@@ -3,11 +3,9 @@ package agent
 import (
 	"encoding/hex"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/armon/go-metrics"
@@ -32,120 +30,56 @@ const (
 // DNSServer is used to wrap an Agent and expose various
 // service discovery endpoints using a DNS interface.
 type DNSServer struct {
-	agent        *Agent
-	config       *DNSConfig
-	dnsHandler   *dns.ServeMux
-	dnsServer    *dns.Server
-	dnsServerTCP *dns.Server
-	domain       string
-	recursors    []string
-	logger       *log.Logger
+	*dns.Server
+	agent     *Agent
+	config    *DNSConfig
+	domain    string
+	recursors []string
+	logger    *log.Logger
 }
 
-// Shutdown stops the DNS Servers
-func (d *DNSServer) Shutdown() {
-	if err := d.dnsServer.Shutdown(); err != nil {
-		d.logger.Printf("[ERR] dns: error stopping udp server: %v", err)
+func NewDNSServer(a *Agent) (*DNSServer, error) {
+	var recursors []string
+	for _, r := range a.config.DNSRecursors {
+		ra, err := recursorAddr(r)
+		if err != nil {
+			return nil, fmt.Errorf("Invalid recursor address: %v", err)
+		}
+		recursors = append(recursors, ra)
 	}
-	if err := d.dnsServerTCP.Shutdown(); err != nil {
-		d.logger.Printf("[ERR] dns: error stopping tcp server: %v", err)
-	}
-}
 
-// NewDNSServer starts a new DNS server to provide an agent interface
-func NewDNSServer(agent *Agent, config *DNSConfig, logOutput io.Writer, domain string, bind string, recursors []string) (*DNSServer, error) {
 	// Make sure domain is FQDN, make it case insensitive for ServeMux
-	domain = dns.Fqdn(strings.ToLower(domain))
+	domain := dns.Fqdn(strings.ToLower(a.config.Domain))
 
-	// Construct the DNS components
-	mux := dns.NewServeMux()
-
-	var wg sync.WaitGroup
-
-	// Setup the servers
-	server := &dns.Server{
-		Addr:              bind,
-		Net:               "udp",
-		Handler:           mux,
-		UDPSize:           65535,
-		NotifyStartedFunc: wg.Done,
-	}
-	serverTCP := &dns.Server{
-		Addr:              bind,
-		Net:               "tcp",
-		Handler:           mux,
-		NotifyStartedFunc: wg.Done,
-	}
-
-	// Create the server
 	srv := &DNSServer{
-		agent:        agent,
-		config:       config,
-		dnsHandler:   mux,
-		dnsServer:    server,
-		dnsServerTCP: serverTCP,
-		domain:       domain,
-		recursors:    recursors,
-		logger:       log.New(logOutput, "", log.LstdFlags),
+		agent:     a,
+		config:    &a.config.DNSConfig,
+		domain:    domain,
+		logger:    a.logger,
+		recursors: recursors,
 	}
 
-	// Register mux handler, for reverse lookup
-	mux.HandleFunc("arpa.", srv.handlePtr)
+	return srv, nil
+}
 
-	// Register mux handlers
-	mux.HandleFunc(domain, srv.handleQuery)
-	if len(recursors) > 0 {
-		validatedRecursors := make([]string, len(recursors))
-
-		for idx, recursor := range recursors {
-			recursor, err := recursorAddr(recursor)
-			if err != nil {
-				return nil, fmt.Errorf("Invalid recursor address: %v", err)
-			}
-			validatedRecursors[idx] = recursor
-		}
-
-		srv.recursors = validatedRecursors
-		mux.HandleFunc(".", srv.handleRecurse)
+func (s *DNSServer) ListenAndServe(network, addr string, notif func()) error {
+	mux := dns.NewServeMux()
+	mux.HandleFunc("arpa.", s.handlePtr)
+	mux.HandleFunc(s.domain, s.handleQuery)
+	if len(s.recursors) > 0 {
+		mux.HandleFunc(".", s.handleRecurse)
 	}
 
-	wg.Add(2)
-
-	// Async start the DNS Servers, handle a potential error
-	errCh := make(chan error, 1)
-	go func() {
-		if err := server.ListenAndServe(); err != nil {
-			srv.logger.Printf("[ERR] dns: error starting udp server: %v", err)
-			errCh <- fmt.Errorf("dns udp setup failed: %v", err)
-		}
-	}()
-
-	errChTCP := make(chan error, 1)
-	go func() {
-		if err := serverTCP.ListenAndServe(); err != nil {
-			srv.logger.Printf("[ERR] dns: error starting tcp server: %v", err)
-			errChTCP <- fmt.Errorf("dns tcp setup failed: %v", err)
-		}
-	}()
-
-	// Wait for NotifyStartedFunc callbacks indicating server has started
-	startCh := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(startCh)
-	}()
-
-	// Wait for either the check, listen error, or timeout
-	select {
-	case e := <-errCh:
-		return srv, e
-	case e := <-errChTCP:
-		return srv, e
-	case <-startCh:
-		return srv, nil
-	case <-time.After(time.Second):
-		return srv, fmt.Errorf("timeout setting up DNS server")
+	s.Server = &dns.Server{
+		Addr:              addr,
+		Net:               network,
+		Handler:           mux,
+		NotifyStartedFunc: notif,
 	}
+	if network == "udp" {
+		s.UDPSize = 65535
+	}
+	return s.Server.ListenAndServe()
 }
 
 // recursorAddr is used to add a port to the recursor if omitted.
@@ -831,6 +765,12 @@ func (d *DNSServer) serviceNodeRecords(dc string, nodes structs.CheckServiceNode
 		addr := translateAddress(d.agent.config, dc, node.Node.Address, node.Node.TaggedAddresses)
 		if node.Service.Address != "" {
 			addr = node.Service.Address
+		}
+
+		// If the service address is a CNAME for the service we are looking
+		// for then use the node address.
+		if qName == strings.TrimSuffix(addr, ".")+"." {
+			addr = node.Node.Address
 		}
 
 		// Avoid duplicate entries, possible if a node has

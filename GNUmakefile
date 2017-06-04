@@ -48,7 +48,14 @@ cov:
 
 test: dev
 	go test -tags "$(GOTAGS)" -i -run '^$$' ./...
-	( set -o pipefail ; go test -tags "$(GOTAGS)" -v ./... | tee test.log )
+	go test -tags "$(GOTAGS)" -v $$(go list ./... | egrep -v '(consul/consul|vendor)') > test.log 2>&1 || echo 'FAIL_TOKEN' >> test.log
+	go test -tags "$(GOTAGS)" -v $$(go list ./... | egrep '(consul/consul)') >> test.log 2>&1 || echo 'FAIL_TOKEN' >> test.log
+	@if [ "$$TRAVIS" == "true" ] ; then cat test.log ; fi
+	@if grep -q 'FAIL_TOKEN' test.log ; then grep 'FAIL:' test.log ; exit 1 ; else echo 'PASS' ; fi
+
+test-race: dev
+	go test -tags "$(GOTAGS)" -i -run '^$$' ./...
+	( set -o pipefail ; go test -race -tags "$(GOTAGS)" -v ./... 2>&1 | tee test-race.log )
 
 cover:
 	go test $(GOFILES) --cover

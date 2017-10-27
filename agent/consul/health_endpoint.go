@@ -5,7 +5,7 @@ import (
 
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/consul/agent/consul/state"
-	"github.com/hashicorp/consul/agent/consul/structs"
+	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/go-memdb"
 )
 
@@ -141,12 +141,18 @@ func (h *Health) ServiceNodes(args *structs.ServiceSpecificRequest, reply *struc
 	if err == nil {
 		metrics.IncrCounterWithLabels([]string{"consul", "health", "service", "query"}, 1,
 			[]metrics.Label{{Name: "service", Value: args.ServiceName}})
+		metrics.IncrCounterWithLabels([]string{"health", "service", "query"}, 1,
+			[]metrics.Label{{Name: "service", Value: args.ServiceName}})
 		if args.ServiceTag != "" {
 			metrics.IncrCounterWithLabels([]string{"consul", "health", "service", "query-tag"}, 1,
+				[]metrics.Label{{Name: "service", Value: args.ServiceName}, {Name: "tag", Value: args.ServiceTag}})
+			metrics.IncrCounterWithLabels([]string{"health", "service", "query-tag"}, 1,
 				[]metrics.Label{{Name: "service", Value: args.ServiceName}, {Name: "tag", Value: args.ServiceTag}})
 		}
 		if len(reply.Nodes) == 0 {
 			metrics.IncrCounterWithLabels([]string{"consul", "health", "service", "not-found"}, 1,
+				[]metrics.Label{{Name: "service", Value: args.ServiceName}})
+			metrics.IncrCounterWithLabels([]string{"health", "service", "not-found"}, 1,
 				[]metrics.Label{{Name: "service", Value: args.ServiceName}})
 		}
 	}

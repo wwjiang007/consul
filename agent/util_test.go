@@ -4,27 +4,9 @@ import (
 	"os"
 	"runtime"
 	"testing"
-	"time"
 
 	"github.com/hashicorp/consul/testutil"
 )
-
-func TestAEScale(t *testing.T) {
-	t.Parallel()
-	intv := time.Minute
-	if v := aeScale(intv, 100); v != intv {
-		t.Fatalf("Bad: %v", v)
-	}
-	if v := aeScale(intv, 200); v != 2*intv {
-		t.Fatalf("Bad: %v", v)
-	}
-	if v := aeScale(intv, 1000); v != 4*intv {
-		t.Fatalf("Bad: %v", v)
-	}
-	if v := aeScale(intv, 10000); v != 8*intv {
-		t.Fatalf("Bad: %v", v)
-	}
-}
 
 func TestStringHash(t *testing.T) {
 	t.Parallel()
@@ -46,22 +28,22 @@ func TestSetFilePermissions(t *testing.T) {
 	defer os.Remove(path)
 
 	// Bad UID fails
-	if err := setFilePermissions(path, UnixSocketPermissions{Usr: "%"}); err == nil {
+	if err := setFilePermissions(path, "%", "", ""); err == nil {
 		t.Fatalf("should fail")
 	}
 
 	// Bad GID fails
-	if err := setFilePermissions(path, UnixSocketPermissions{Grp: "%"}); err == nil {
+	if err := setFilePermissions(path, "", "%", ""); err == nil {
 		t.Fatalf("should fail")
 	}
 
 	// Bad mode fails
-	if err := setFilePermissions(path, UnixSocketPermissions{Perms: "%"}); err == nil {
+	if err := setFilePermissions(path, "", "", "%"); err == nil {
 		t.Fatalf("should fail")
 	}
 
 	// Allows omitting user/group/mode
-	if err := setFilePermissions(path, UnixSocketPermissions{}); err != nil {
+	if err := setFilePermissions(path, "", "", ""); err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
@@ -69,7 +51,7 @@ func TestSetFilePermissions(t *testing.T) {
 	if err := os.Chmod(path, 0700); err != nil {
 		t.Fatalf("err: %s", err)
 	}
-	if err := setFilePermissions(path, UnixSocketPermissions{}); err != nil {
+	if err := setFilePermissions(path, "", "", ""); err != nil {
 		t.Fatalf("err: %s", err)
 	}
 	fi, err := os.Stat(path)
@@ -81,7 +63,7 @@ func TestSetFilePermissions(t *testing.T) {
 	}
 
 	// Changes mode if given
-	if err := setFilePermissions(path, UnixSocketPermissions{Perms: "0777"}); err != nil {
+	if err := setFilePermissions(path, "", "", "0777"); err != nil {
 		t.Fatalf("err: %s", err)
 	}
 	fi, err = os.Stat(path)

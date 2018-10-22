@@ -27,7 +27,9 @@ func TestStatsFetcher(t *testing.T) {
 
 	joinLAN(t, s2, s1)
 	joinLAN(t, s3, s1)
-	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, s1.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, s2.RPC, "dc1")
+	testrpc.WaitForTestAgent(t, s3.RPC, "dc1")
 
 	members := s1.serfLAN.Members()
 	if len(members) != 3 {
@@ -47,7 +49,7 @@ func TestStatsFetcher(t *testing.T) {
 	func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		stats := s1.statsFetcher.Fetch(ctx, servers)
+		stats := s1.statsFetcher.Fetch(ctx, s1.LANMembers())
 		if len(stats) != 3 {
 			t.Fatalf("bad: %#v", stats)
 		}
@@ -73,7 +75,7 @@ func TestStatsFetcher(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		stats := s1.statsFetcher.Fetch(ctx, servers)
+		stats := s1.statsFetcher.Fetch(ctx, s1.LANMembers())
 		if len(stats) != 2 {
 			t.Fatalf("bad: %#v", stats)
 		}

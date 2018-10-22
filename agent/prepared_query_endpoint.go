@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	cachetype "github.com/hashicorp/consul/agent/cache-types"
 	"github.com/hashicorp/consul/agent/consul"
 	"github.com/hashicorp/consul/agent/structs"
 )
@@ -22,12 +23,10 @@ func (s *HTTPServer) preparedQueryCreate(resp http.ResponseWriter, req *http.Req
 	}
 	s.parseDC(req, &args.Datacenter)
 	s.parseToken(req, &args.Token)
-	if req.ContentLength > 0 {
-		if err := decodeBody(req, &args.Query, nil); err != nil {
-			resp.WriteHeader(http.StatusBadRequest)
-			fmt.Fprintf(resp, "Request decode failed: %v", err)
-			return nil, nil
-		}
+	if err := decodeBody(req, &args.Query, nil); err != nil {
+		resp.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(resp, "Request decode failed: %v", err)
+		return nil, nil
 	}
 
 	var reply string
@@ -45,9 +44,17 @@ func (s *HTTPServer) preparedQueryList(resp http.ResponseWriter, req *http.Reque
 	}
 
 	var reply structs.IndexedPreparedQueries
+	defer setMeta(resp, &reply.QueryMeta)
+RETRY_ONCE:
 	if err := s.agent.RPC("PreparedQuery.List", &args, &reply); err != nil {
 		return nil, err
 	}
+	if args.QueryOptions.AllowStale && args.MaxStaleDuration > 0 && args.MaxStaleDuration < reply.LastContact {
+		args.AllowStale = false
+		args.MaxStaleDuration = 0
+		goto RETRY_ONCE
+	}
+	reply.ConsistencyLevel = args.QueryOptions.ConsistencyLevel()
 
 	// Use empty list instead of nil.
 	if reply.Queries == nil {
@@ -101,17 +108,56 @@ func (s *HTTPServer) preparedQueryExecute(id string, resp http.ResponseWriter, r
 		return nil, fmt.Errorf("Bad limit: %s", err)
 	}
 
-	var reply structs.PreparedQueryExecuteResponse
-	if err := s.agent.RPC("PreparedQuery.Execute", &args, &reply); err != nil {
-		// We have to check the string since the RPC sheds
-		// the specific error type.
-		if err.Error() == consul.ErrQueryNotFound.Error() {
-			resp.WriteHeader(http.StatusNotFound)
-			fmt.Fprint(resp, err.Error())
-			return nil, nil
+	params := req.URL.Query()
+	if raw := params.Get("connect"); raw != "" {
+		val, err := strconv.ParseBool(raw)
+		if err != nil {
+			return nil, fmt.Errorf("Error parsing 'connect' value: %s", err)
 		}
-		return nil, err
+
+		args.Connect = val
 	}
+
+	var reply structs.PreparedQueryExecuteResponse
+	defer setMeta(resp, &reply.QueryMeta)
+
+	if args.QueryOptions.UseCache {
+		raw, m, err := s.agent.cache.Get(cachetype.PreparedQueryName, &args)
+		if err != nil {
+			// Don't return error if StaleIfError is set and we are within it and had
+			// a cached value.
+			if raw != nil && m.Hit && args.QueryOptions.StaleIfError > m.Age {
+				// Fall through to the happy path below
+			} else {
+				return nil, err
+			}
+		}
+		defer setCacheMeta(resp, &m)
+		r, ok := raw.(*structs.PreparedQueryExecuteResponse)
+		if !ok {
+			// This should never happen, but we want to protect against panics
+			return nil, fmt.Errorf("internal error: response type not correct")
+		}
+		reply = *r
+	} else {
+	RETRY_ONCE:
+		if err := s.agent.RPC("PreparedQuery.Execute", &args, &reply); err != nil {
+			// We have to check the string since the RPC sheds
+			// the specific error type.
+			if err.Error() == consul.ErrQueryNotFound.Error() {
+				resp.WriteHeader(http.StatusNotFound)
+				fmt.Fprint(resp, err.Error())
+				return nil, nil
+			}
+			return nil, err
+		}
+		if args.QueryOptions.AllowStale && args.MaxStaleDuration > 0 && args.MaxStaleDuration < reply.LastContact {
+			args.AllowStale = false
+			args.MaxStaleDuration = 0
+			goto RETRY_ONCE
+		}
+	}
+	reply.ConsistencyLevel = args.QueryOptions.ConsistencyLevel()
 
 	// Note that we translate using the DC that the results came from, since
 	// a query can fail over to a different DC than where the execute request
@@ -147,6 +193,8 @@ func (s *HTTPServer) preparedQueryExplain(id string, resp http.ResponseWriter, r
 	}
 
 	var reply structs.PreparedQueryExplainResponse
+	defer setMeta(resp, &reply.QueryMeta)
+RETRY_ONCE:
 	if err := s.agent.RPC("PreparedQuery.Explain", &args, &reply); err != nil {
 		// We have to check the string since the RPC sheds
 		// the specific error type.
@@ -157,6 +205,12 @@ func (s *HTTPServer) preparedQueryExplain(id string, resp http.ResponseWriter, r
 		}
 		return nil, err
 	}
+	if args.QueryOptions.AllowStale && args.MaxStaleDuration > 0 && args.MaxStaleDuration < reply.LastContact {
+		args.AllowStale = false
+		args.MaxStaleDuration = 0
+		goto RETRY_ONCE
+	}
+	reply.ConsistencyLevel = args.QueryOptions.ConsistencyLevel()
 	return reply, nil
 }
 
@@ -170,6 +224,8 @@ func (s *HTTPServer) preparedQueryGet(id string, resp http.ResponseWriter, req *
 	}
 
 	var reply structs.IndexedPreparedQueries
+	defer setMeta(resp, &reply.QueryMeta)
+RETRY_ONCE:
 	if err := s.agent.RPC("PreparedQuery.Get", &args, &reply); err != nil {
 		// We have to check the string since the RPC sheds
 		// the specific error type.
@@ -180,6 +236,12 @@ func (s *HTTPServer) preparedQueryGet(id string, resp http.ResponseWriter, req *
 		}
 		return nil, err
 	}
+	if args.QueryOptions.AllowStale && args.MaxStaleDuration > 0 && args.MaxStaleDuration < reply.LastContact {
+		args.AllowStale = false
+		args.MaxStaleDuration = 0
+		goto RETRY_ONCE
+	}
+	reply.ConsistencyLevel = args.QueryOptions.ConsistencyLevel()
 	return reply.Queries, nil
 }
 
@@ -230,9 +292,31 @@ func (s *HTTPServer) preparedQueryDelete(id string, resp http.ResponseWriter, re
 	return nil, nil
 }
 
+// PreparedQuerySpecificOptions handles OPTIONS requests to prepared query endpoints.
+func (s *HTTPServer) preparedQuerySpecificOptions(resp http.ResponseWriter, req *http.Request) interface{} {
+	path := req.URL.Path
+	switch {
+	case strings.HasSuffix(path, "/execute"):
+		resp.Header().Add("Allow", strings.Join([]string{"OPTIONS", "GET"}, ","))
+		return resp
+
+	case strings.HasSuffix(path, "/explain"):
+		resp.Header().Add("Allow", strings.Join([]string{"OPTIONS", "GET"}, ","))
+		return resp
+
+	default:
+		resp.Header().Add("Allow", strings.Join([]string{"OPTIONS", "GET", "PUT", "DELETE"}, ","))
+		return resp
+	}
+}
+
 // PreparedQuerySpecific handles all the prepared query requests specific to a
 // particular query.
 func (s *HTTPServer) PreparedQuerySpecific(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	if req.Method == "OPTIONS" {
+		return s.preparedQuerySpecificOptions(resp, req), nil
+	}
+
 	path := req.URL.Path
 	id := strings.TrimPrefix(path, "/v1/query/")
 

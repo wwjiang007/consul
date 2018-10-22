@@ -29,18 +29,19 @@ everything will be in sync within a few seconds.
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required             |
-| ---------------- | ----------------- | ------------------------ |
-| `NO`             | `none`            | `node:read,service:read` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required             |
+| ---------------- | ----------------- | ------------- | ------------------------ |
+| `NO`             | `none`            | `none`        | `node:read,service:read` |
 
 ### Sample Request
 
 ```text
 $ curl \
-    https://consul.rocks/v1/agent/checks
+    http://127.0.0.1:8500/v1/agent/checks
 ```
 
 ### Sample Response
@@ -55,7 +56,8 @@ $ curl \
     "Notes": "",
     "Output": "",
     "ServiceID": "redis",
-    "ServiceName": "redis"
+    "ServiceName": "redis",
+    "ServiceTags": ["primary"]
   }
 }
 ```
@@ -72,12 +74,13 @@ check and keeping the Catalog in sync.
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required               |
-| ---------------- | ----------------- | -------------------------- |
-| `NO`             | `none`            | `node:write,service:write` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required               |
+| ---------------- | ----------------- | ------------- | -------------------------- |
+| `NO`             | `none`            | `none`        | `node:write,service:write` |
 
 ### Parameters
 
@@ -115,10 +118,29 @@ The table below shows this endpoint's support for
     continue to be accepted in future versions of Consul), and `Args` in Consul
     1.0.1 and later.
 
+- `AliasNode` `(string: "")` - Specifies the ID of the node for an alias check.
+  If no service is specified, the check will alias the health of the node.
+  If a service is specified, the check will alias the specified service on
+  this particular node.
+
+- `AliasService` `(string: "")` - Specifies the ID of a service for an
+  alias check. If the service is not registered with the same agent,
+  `AliasNode` must also be specified. Note this is the service _ID_ and
+  not the service _name_ (though they are very often the same).
+
 - `DockerContainerID` `(string: "")` - Specifies that the check is a Docker
   check, and Consul will evaluate the script every `Interval` in the given
   container using the specified `Shell`. Note that `Shell` is currently only
   supported for Docker checks.
+
+- `GRPC` `(string: "")` - Specifies a `gRPC` check's endpoint that supports the standard
+  [gRPC health checking protocol](https://github.com/grpc/grpc/blob/master/doc/health-checking.md).
+  The state of the check will be updated at the given `Interval` by probing the configured
+  endpoint.
+
+- `GRPCUseTLS` `(bool: false)` - Specifies whether to use TLS for this `gRPC` health check.
+  If TLS is enabled, then by default, a valid TLS certificate is expected. Certificate
+  verification can be turned off by setting `TLSSkipVerify` to `true`.
 
 - `HTTP` `(string: "")` - Specifies an `HTTP` check to perform a `GET` request
   against the value of `HTTP` (expected to be a URL) every `Interval`. If the
@@ -133,6 +155,10 @@ The table below shows this endpoint's support for
 
 - `Header` `(map[string][]string: {})` - Specifies a set of headers that should
   be set for `HTTP` checks. Each header can have multiple values.
+
+- `Timeout` `(duration: 10s)` - Specifies a timeout for outgoing connections in the
+  case of a Script, HTTP, TCP, or gRPC check. Can be specified in the form of "10s"
+  or "5m" (i.e., 10 seconds or 5 minutes, respectively).
 
 - `TLSSkipVerify` `(bool: false)` - Specifies if the certificate for an HTTPS
   check should not be verified.
@@ -180,7 +206,7 @@ The table below shows this endpoint's support for
 $ curl \
    --request PUT \
    --data @payload.json \
-   https://consul.rocks/v1/agent/check/register
+   http://127.0.0.1:8500/v1/agent/check/register
 ```
 
 ## Deregister Check
@@ -195,12 +221,13 @@ not exist, no action is taken.
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required               |
-| ---------------- | ----------------- | -------------------------- |
-| `NO`             | `none`            | `node:write,service:write` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required               |
+| ---------------- | ----------------- | ------------- | -------------------------- |
+| `NO`             | `none`            | `none`        | `node:write,service:write` |
 
 ### Parameters
 
@@ -212,7 +239,7 @@ The table below shows this endpoint's support for
 ```text
 $ curl \
     --request PUT \
-    https://consul.rocks/v1/agent/check/deregister/my-check-id
+    http://127.0.0.1:8500/v1/agent/check/deregister/my-check-id
 ```
 
 ## TTL Check Pass
@@ -226,12 +253,13 @@ This endpoint is used with a TTL type check to set the status of the check to
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required               |
-| ---------------- | ----------------- | -------------------------- |
-| `NO`             | `none`            | `node:write,service:write` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required               |
+| ---------------- | ----------------- | ------------- | -------------------------- |
+| `NO`             | `none`            | `none`        | `node:write,service:write` |
 
 ### Parameters
 
@@ -245,7 +273,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/v1/agent/check/pass/my-check-id
+    http://127.0.0.1:8500/v1/agent/check/pass/my-check-id
 ```
 
 ## TTL Check Warn
@@ -259,12 +287,13 @@ This endpoint is used with a TTL type check to set the status of the check to
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required               |
-| ---------------- | ----------------- | -------------------------- |
-| `NO`             | `none`            | `node:write,service:write` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required               |
+| ---------------- | ----------------- | ------------- | -------------------------- |
+| `NO`             | `none`            | `none`        | `node:write,service:write` |
 
 ### Parameters
 
@@ -278,7 +307,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/v1/agent/check/warn/my-check-id
+    http://127.0.0.1:8500/v1/agent/check/warn/my-check-id
 ```
 
 ## TTL Check Fail
@@ -292,12 +321,13 @@ This endpoint is used with a TTL type check to set the status of the check to
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required               |
-| ---------------- | ----------------- | -------------------------- |
-| `NO`             | `none`            | `node:write,service:write` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required               |
+| ---------------- | ----------------- | ------------- | -------------------------- |
+| `NO`             | `none`            | `none`        | `node:write,service:write` |
 
 ### Parameters
 
@@ -311,7 +341,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/v1/agent/check/fail/my-check-id
+    http://127.0.0.1:8500/v1/agent/check/fail/my-check-id
 ```
 
 ## TTL Check Update
@@ -325,12 +355,13 @@ to reset the TTL clock.
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required               |
-| ---------------- | ----------------- | -------------------------- |
-| `NO`             | `none`            | `node:write,service:write` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required               |
+| ---------------- | ----------------- | ------------- | -------------------------- |
+| `NO`             | `none`            | `none`        | `node:write,service:write` |
 
 ### Parameters
 
@@ -358,5 +389,5 @@ The table below shows this endpoint's support for
 $ curl \
     --request PUT \
     --data @payload.json \
-    https://consul.rocks/v1/agent/check/update/my-check-id
+    http://127.0.0.1:8500/v1/agent/check/update/my-check-id
 ```

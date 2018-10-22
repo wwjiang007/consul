@@ -20,9 +20,11 @@ import (
 
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/consul/logger"
+	"github.com/hashicorp/consul/testrpc"
 	"github.com/hashicorp/consul/testutil"
 	"github.com/hashicorp/go-cleanhttp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/net/http2"
 )
 
@@ -166,11 +168,11 @@ func TestHTTPServer_H2(t *testing.T) {
 		resp.WriteHeader(http.StatusOK)
 		fmt.Fprint(resp, req.Proto)
 	}
-	mux, ok := a.srv.Handler.(*http.ServeMux)
+	w, ok := a.srv.Handler.(*wrappedMux)
 	if !ok {
 		t.Fatalf("handler is not expected type")
 	}
-	mux.HandleFunc("/echo", handler)
+	w.mux.HandleFunc("/echo", handler)
 
 	// Call it and make sure we see HTTP/2.
 	url := fmt.Sprintf("https://%s/echo", a.srv.ln.Addr().String())
@@ -299,7 +301,7 @@ func TestHTTPAPI_BlockEndpoints(t *testing.T) {
 	{
 		req, _ := http.NewRequest("GET", "/v1/agent/self", nil)
 		resp := httptest.NewRecorder()
-		a.srv.wrap(handler)(resp, req)
+		a.srv.wrap(handler, []string{"GET"})(resp, req)
 		if got, want := resp.Code, http.StatusForbidden; got != want {
 			t.Fatalf("bad response code got %d want %d", got, want)
 		}
@@ -309,10 +311,35 @@ func TestHTTPAPI_BlockEndpoints(t *testing.T) {
 	{
 		req, _ := http.NewRequest("GET", "/v1/agent/checks", nil)
 		resp := httptest.NewRecorder()
-		a.srv.wrap(handler)(resp, req)
+		a.srv.wrap(handler, []string{"GET"})(resp, req)
 		if got, want := resp.Code, http.StatusOK; got != want {
 			t.Fatalf("bad response code got %d want %d", got, want)
 		}
+	}
+}
+
+func TestHTTPAPI_Ban_Nonprintable_Characters(t *testing.T) {
+	a := NewTestAgent(t.Name(), "")
+	defer a.Shutdown()
+
+	req, _ := http.NewRequest("GET", "/v1/kv/bad\x00ness", nil)
+	resp := httptest.NewRecorder()
+	a.srv.Handler.ServeHTTP(resp, req)
+	if got, want := resp.Code, http.StatusBadRequest; got != want {
+		t.Fatalf("bad response code got %d want %d", got, want)
+	}
+}
+
+func TestHTTPAPI_Allow_Nonprintable_Characters_With_Flag(t *testing.T) {
+	a := NewTestAgent(t.Name(), "disable_http_unprintable_char_filter = true")
+	defer a.Shutdown()
+
+	req, _ := http.NewRequest("GET", "/v1/kv/bad\x00ness", nil)
+	resp := httptest.NewRecorder()
+	a.srv.Handler.ServeHTTP(resp, req)
+	// Key doesn't actually exist so we should get 404
+	if got, want := resp.Code, http.StatusNotFound; got != want {
+		t.Fatalf("bad response code got %d want %d", got, want)
 	}
 }
 
@@ -329,7 +356,7 @@ func TestHTTPAPI_TranslateAddrHeader(t *testing.T) {
 		}
 
 		req, _ := http.NewRequest("GET", "/v1/agent/self", nil)
-		a.srv.wrap(handler)(resp, req)
+		a.srv.wrap(handler, []string{"GET"})(resp, req)
 
 		translate := resp.Header().Get("X-Consul-Translate-Addresses")
 		if translate != "" {
@@ -350,7 +377,7 @@ func TestHTTPAPI_TranslateAddrHeader(t *testing.T) {
 		}
 
 		req, _ := http.NewRequest("GET", "/v1/agent/self", nil)
-		a.srv.wrap(handler)(resp, req)
+		a.srv.wrap(handler, []string{"GET"})(resp, req)
 
 		translate := resp.Header().Get("X-Consul-Translate-Addresses")
 		if translate != "true" {
@@ -377,7 +404,7 @@ func TestHTTPAPIResponseHeaders(t *testing.T) {
 	}
 
 	req, _ := http.NewRequest("GET", "/v1/agent/self", nil)
-	a.srv.wrap(handler)(resp, req)
+	a.srv.wrap(handler, []string{"GET"})(resp, req)
 
 	origin := resp.Header().Get("Access-Control-Allow-Origin")
 	if origin != "*" {
@@ -387,115 +414,6 @@ func TestHTTPAPIResponseHeaders(t *testing.T) {
 	xss := resp.Header().Get("X-XSS-Protection")
 	if xss != "1; mode=block" {
 		t.Fatalf("bad X-XSS-Protection header: expected %q, got %q", "1; mode=block", xss)
-	}
-}
-
-func TestHTTPAPI_MethodNotAllowed(t *testing.T) {
-	tests := []struct {
-		methods, uri string
-	}{
-		{"PUT", "/v1/acl/bootstrap"},
-		{"PUT", "/v1/acl/create"},
-		{"PUT", "/v1/acl/update"},
-		{"PUT", "/v1/acl/destroy/"},
-		{"GET", "/v1/acl/info/"},
-		{"PUT", "/v1/acl/clone/"},
-		{"GET", "/v1/acl/list"},
-		{"GET", "/v1/acl/replication"},
-		{"PUT", "/v1/agent/token/"},
-		{"GET", "/v1/agent/self"},
-		{"GET", "/v1/agent/members"},
-		{"PUT", "/v1/agent/check/deregister/"},
-		{"PUT", "/v1/agent/check/fail/"},
-		{"PUT", "/v1/agent/check/pass/"},
-		{"PUT", "/v1/agent/check/register"},
-		{"PUT", "/v1/agent/check/update/"},
-		{"PUT", "/v1/agent/check/warn/"},
-		{"GET", "/v1/agent/checks"},
-		{"PUT", "/v1/agent/force-leave/"},
-		{"PUT", "/v1/agent/join/"},
-		{"PUT", "/v1/agent/leave"},
-		{"PUT", "/v1/agent/maintenance"},
-		{"GET", "/v1/agent/metrics"},
-		// {"GET", "/v1/agent/monitor"}, // requires LogWriter. Hangs if LogWriter is provided
-		{"PUT", "/v1/agent/reload"},
-		{"PUT", "/v1/agent/service/deregister/"},
-		{"PUT", "/v1/agent/service/maintenance/"},
-		{"PUT", "/v1/agent/service/register"},
-		{"GET", "/v1/agent/services"},
-		{"GET", "/v1/catalog/datacenters"},
-		{"PUT", "/v1/catalog/deregister"},
-		{"GET", "/v1/catalog/node/"},
-		{"GET", "/v1/catalog/nodes"},
-		{"PUT", "/v1/catalog/register"},
-		{"GET", "/v1/catalog/service/"},
-		{"GET", "/v1/catalog/services"},
-		{"GET", "/v1/coordinate/datacenters"},
-		{"GET", "/v1/coordinate/nodes"},
-		{"GET", "/v1/coordinate/node/"},
-		{"PUT", "/v1/event/fire/"},
-		{"GET", "/v1/event/list"},
-		{"GET", "/v1/health/checks/"},
-		{"GET", "/v1/health/node/"},
-		{"GET", "/v1/health/service/"},
-		{"GET", "/v1/health/state/"},
-		{"GET", "/v1/internal/ui/node/"},
-		{"GET", "/v1/internal/ui/nodes"},
-		{"GET", "/v1/internal/ui/services"},
-		{"GET PUT DELETE", "/v1/kv/"},
-		{"GET PUT", "/v1/operator/autopilot/configuration"},
-		{"GET", "/v1/operator/autopilot/health"},
-		{"GET POST PUT DELETE", "/v1/operator/keyring"},
-		{"GET", "/v1/operator/raft/configuration"},
-		{"DELETE", "/v1/operator/raft/peer"},
-		{"GET POST", "/v1/query"},
-		{"GET PUT DELETE", "/v1/query/"},
-		{"GET", "/v1/query/xxx/execute"},
-		{"GET", "/v1/query/xxx/explain"},
-		{"PUT", "/v1/session/create"},
-		{"PUT", "/v1/session/destroy/"},
-		{"GET", "/v1/session/info/"},
-		{"GET", "/v1/session/list"},
-		{"GET", "/v1/session/node/"},
-		{"PUT", "/v1/session/renew/"},
-		{"GET PUT", "/v1/snapshot"},
-		{"GET", "/v1/status/leader"},
-		// {"GET", "/v1/status/peers"},// hangs
-		{"PUT", "/v1/txn"},
-
-		// enterprise only
-		// {"GET POST", "/v1/operator/area"},
-		// {"GET PUT DELETE", "/v1/operator/area/"},
-		// {"GET", "/v1/operator/area/xxx/members"},
-	}
-
-	a := NewTestAgent(t.Name(), `acl_datacenter = "dc1"`)
-	a.Agent.LogWriter = logger.NewLogWriter(512)
-	defer a.Shutdown()
-
-	all := []string{"GET", "PUT", "POST", "DELETE", "HEAD"}
-	client := http.Client{}
-
-	for _, tt := range tests {
-		for _, m := range all {
-
-			t.Run(m+" "+tt.uri, func(t *testing.T) {
-				uri := fmt.Sprintf("http://%s%s", a.HTTPAddr(), tt.uri)
-				req, _ := http.NewRequest(m, uri, nil)
-				resp, err := client.Do(req)
-				if err != nil {
-					t.Fatal("client.Do failed: ", err)
-				}
-
-				allowed := strings.Contains(tt.methods, m)
-				if allowed && resp.StatusCode == http.StatusMethodNotAllowed {
-					t.Fatalf("method allowed: got status code %d want any other code", resp.StatusCode)
-				}
-				if !allowed && resp.StatusCode != http.StatusMethodNotAllowed {
-					t.Fatalf("method not allowed: got status code %d want %d", resp.StatusCode, http.StatusMethodNotAllowed)
-				}
-			})
-		}
 	}
 }
 
@@ -511,7 +429,7 @@ func TestContentTypeIsJSON(t *testing.T) {
 	}
 
 	req, _ := http.NewRequest("GET", "/v1/kv/key", nil)
-	a.srv.wrap(handler)(resp, req)
+	a.srv.wrap(handler, []string{"GET"})(resp, req)
 
 	contentType := resp.Header().Get("Content-Type")
 
@@ -565,7 +483,7 @@ func TestHTTP_wrap_obfuscateLog(t *testing.T) {
 		t.Run(url, func(t *testing.T) {
 			resp := httptest.NewRecorder()
 			req, _ := http.NewRequest("GET", url, nil)
-			a.srv.wrap(handler)(resp, req)
+			a.srv.wrap(handler, []string{"GET"})(resp, req)
 
 			if got := buf.String(); !strings.Contains(got, want) {
 				t.Fatalf("got %s want %s", got, want)
@@ -597,7 +515,7 @@ func testPrettyPrint(pretty string, t *testing.T) {
 
 	urlStr := "/v1/kv/key?" + pretty
 	req, _ := http.NewRequest("GET", urlStr, nil)
-	a.srv.wrap(handler)(resp, req)
+	a.srv.wrap(handler, []string{"GET"})(resp, req)
 
 	expected, _ := json.MarshalIndent(r, "", "    ")
 	expected = append(expected, "\n"...)
@@ -651,6 +569,146 @@ func TestParseSource(t *testing.T) {
 	}
 }
 
+func TestParseCacheControl(t *testing.T) {
+
+	tests := []struct {
+		name      string
+		headerVal string
+		want      structs.QueryOptions
+		wantErr   bool
+	}{
+		{
+			name:      "empty header",
+			headerVal: "",
+			want:      structs.QueryOptions{},
+			wantErr:   false,
+		},
+		{
+			name:      "simple max-age",
+			headerVal: "max-age=30",
+			want: structs.QueryOptions{
+				MaxAge: 30 * time.Second,
+			},
+			wantErr: false,
+		},
+		{
+			name:      "zero max-age",
+			headerVal: "max-age=0",
+			want: structs.QueryOptions{
+				MustRevalidate: true,
+			},
+			wantErr: false,
+		},
+		{
+			name:      "must-revalidate",
+			headerVal: "must-revalidate",
+			want: structs.QueryOptions{
+				MustRevalidate: true,
+			},
+			wantErr: false,
+		},
+		{
+			name:      "mixes age, must-revalidate",
+			headerVal: "max-age=123, must-revalidate",
+			want: structs.QueryOptions{
+				MaxAge:         123 * time.Second,
+				MustRevalidate: true,
+			},
+			wantErr: false,
+		},
+		{
+			name:      "quoted max-age",
+			headerVal: "max-age=\"30\"",
+			want:      structs.QueryOptions{},
+			wantErr:   true,
+		},
+		{
+			name:      "mixed case max-age",
+			headerVal: "Max-Age=30",
+			want: structs.QueryOptions{
+				MaxAge: 30 * time.Second,
+			},
+			wantErr: false,
+		},
+		{
+			name:      "simple stale-if-error",
+			headerVal: "stale-if-error=300",
+			want: structs.QueryOptions{
+				StaleIfError: 300 * time.Second,
+			},
+			wantErr: false,
+		},
+		{
+			name:      "combined with space",
+			headerVal: "max-age=30, stale-if-error=300",
+			want: structs.QueryOptions{
+				MaxAge:       30 * time.Second,
+				StaleIfError: 300 * time.Second,
+			},
+			wantErr: false,
+		},
+		{
+			name:      "combined no space",
+			headerVal: "stale-IF-error=300,max-age=30",
+			want: structs.QueryOptions{
+				MaxAge:       30 * time.Second,
+				StaleIfError: 300 * time.Second,
+			},
+			wantErr: false,
+		},
+		{
+			name:      "unsupported directive",
+			headerVal: "no-cache",
+			want:      structs.QueryOptions{},
+			wantErr:   false,
+		},
+		{
+			name:      "mixed unsupported directive",
+			headerVal: "no-cache, max-age=120",
+			want: structs.QueryOptions{
+				MaxAge: 120 * time.Second,
+			},
+			wantErr: false,
+		},
+		{
+			name:      "garbage value",
+			headerVal: "max-age=\"I'm not, an int\"",
+			want:      structs.QueryOptions{},
+			wantErr:   true,
+		},
+		{
+			name:      "garbage value with quotes",
+			headerVal: "max-age=\"I'm \\\"not an int\"",
+			want:      structs.QueryOptions{},
+			wantErr:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+
+			r, _ := http.NewRequest("GET", "/foo/bar", nil)
+			if tt.headerVal != "" {
+				r.Header.Set("Cache-Control", tt.headerVal)
+			}
+
+			rr := httptest.NewRecorder()
+			var got structs.QueryOptions
+
+			failed := parseCacheControl(rr, r, &got)
+			if tt.wantErr {
+				require.True(failed)
+				require.Equal(http.StatusBadRequest, rr.Code)
+			} else {
+				require.False(failed)
+			}
+
+			require.Equal(tt.want, got)
+		})
+	}
+}
+
 func TestParseWait(t *testing.T) {
 	t.Parallel()
 	resp := httptest.NewRecorder()
@@ -666,6 +724,104 @@ func TestParseWait(t *testing.T) {
 	}
 	if b.MaxQueryTime != 60*time.Second {
 		t.Fatalf("Bad: %v", b)
+	}
+}
+func TestPProfHandlers_EnableDebug(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	a := NewTestAgent(t.Name(), "enable_debug = true")
+	defer a.Shutdown()
+
+	resp := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/debug/pprof/profile", nil)
+
+	a.srv.Handler.ServeHTTP(resp, req)
+
+	require.Equal(http.StatusOK, resp.Code)
+}
+func TestPProfHandlers_DisableDebugNoACLs(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	a := NewTestAgent(t.Name(), "enable_debug = false")
+	defer a.Shutdown()
+
+	resp := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/debug/pprof/profile", nil)
+
+	a.srv.Handler.ServeHTTP(resp, req)
+
+	require.Equal(http.StatusUnauthorized, resp.Code)
+}
+
+func TestPProfHandlers_ACLs(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	dc1 := "dc1"
+
+	a := NewTestAgent(t.Name(), `
+	acl_datacenter = "`+dc1+`"
+	acl_default_policy = "deny"
+	acl_master_token = "master"
+	acl_agent_token = "agent"
+	acl_agent_master_token = "towel"
+	acl_enforce_version_8 = true
+	enable_debug = false
+`)
+
+	cases := []struct {
+		code        int
+		token       string
+		endpoint    string
+		nilResponse bool
+	}{
+		{
+			code:        http.StatusOK,
+			token:       "master",
+			endpoint:    "/debug/pprof/heap",
+			nilResponse: false,
+		},
+		{
+			code:        http.StatusForbidden,
+			token:       "agent",
+			endpoint:    "/debug/pprof/heap",
+			nilResponse: true,
+		},
+		{
+			code:        http.StatusForbidden,
+			token:       "agent",
+			endpoint:    "/debug/pprof/",
+			nilResponse: true,
+		},
+		{
+			code:        http.StatusForbidden,
+			token:       "",
+			endpoint:    "/debug/pprof/",
+			nilResponse: true,
+		},
+		{
+			code:        http.StatusOK,
+			token:       "master",
+			endpoint:    "/debug/pprof/heap",
+			nilResponse: false,
+		},
+		{
+			code:        http.StatusForbidden,
+			token:       "towel",
+			endpoint:    "/debug/pprof/heap",
+			nilResponse: true,
+		},
+	}
+
+	defer a.Shutdown()
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
+
+	for i, c := range cases {
+		t.Run(fmt.Sprintf("case %d (%#v)", i, c), func(t *testing.T) {
+			req, _ := http.NewRequest("GET", fmt.Sprintf("%s?token=%s", c.endpoint, c.token), nil)
+			resp := httptest.NewRecorder()
+			a.srv.Handler.ServeHTTP(resp, req)
+			assert.Equal(c.code, resp.Code)
+		})
 	}
 }
 
@@ -705,7 +861,9 @@ func TestParseConsistency(t *testing.T) {
 	var b structs.QueryOptions
 
 	req, _ := http.NewRequest("GET", "/v1/catalog/nodes?stale", nil)
-	if d := parseConsistency(resp, req, &b); d {
+	a := NewTestAgent(t.Name(), "")
+	defer a.Shutdown()
+	if d := a.srv.parseConsistency(resp, req, &b); d {
 		t.Fatalf("unexpected done")
 	}
 
@@ -718,7 +876,7 @@ func TestParseConsistency(t *testing.T) {
 
 	b = structs.QueryOptions{}
 	req, _ = http.NewRequest("GET", "/v1/catalog/nodes?consistent", nil)
-	if d := parseConsistency(resp, req, &b); d {
+	if d := a.srv.parseConsistency(resp, req, &b); d {
 		t.Fatalf("unexpected done")
 	}
 
@@ -730,13 +888,70 @@ func TestParseConsistency(t *testing.T) {
 	}
 }
 
+// ensureConsistency check if consistency modes are correctly applied
+// if maxStale < 0 => stale, without MaxStaleDuration
+// if maxStale == 0 => no stale
+// if maxStale > 0 => stale + check duration
+func ensureConsistency(t *testing.T, a *TestAgent, path string, maxStale time.Duration, requireConsistent bool) {
+	t.Helper()
+	req, _ := http.NewRequest("GET", path, nil)
+	var b structs.QueryOptions
+	resp := httptest.NewRecorder()
+	if d := a.srv.parseConsistency(resp, req, &b); d {
+		t.Fatalf("unexpected done")
+	}
+	allowStale := maxStale.Nanoseconds() != 0
+	if b.AllowStale != allowStale {
+		t.Fatalf("Bad Allow Stale")
+	}
+	if maxStale > 0 && b.MaxStaleDuration != maxStale {
+		t.Fatalf("Bad MaxStaleDuration: %d VS expected %d", b.MaxStaleDuration, maxStale)
+	}
+	if b.RequireConsistent != requireConsistent {
+		t.Fatal("Bad Consistent")
+	}
+}
+
+func TestParseConsistencyAndMaxStale(t *testing.T) {
+	a := NewTestAgent(t.Name(), "")
+	defer a.Shutdown()
+
+	// Default => Consistent
+	a.config.DiscoveryMaxStale = time.Duration(0)
+	ensureConsistency(t, a, "/v1/catalog/nodes", 0, false)
+	// Stale, without MaxStale
+	ensureConsistency(t, a, "/v1/catalog/nodes?stale", -1, false)
+	// Override explicitly
+	ensureConsistency(t, a, "/v1/catalog/nodes?max_stale=3s", 3*time.Second, false)
+	ensureConsistency(t, a, "/v1/catalog/nodes?stale&max_stale=3s", 3*time.Second, false)
+
+	// stale by defaul on discovery
+	a.config.DiscoveryMaxStale = time.Duration(7 * time.Second)
+	ensureConsistency(t, a, "/v1/catalog/nodes", a.config.DiscoveryMaxStale, false)
+	// Not in KV
+	ensureConsistency(t, a, "/v1/kv/my/path", 0, false)
+
+	// DiscoveryConsistencyLevel should apply
+	ensureConsistency(t, a, "/v1/health/service/one", a.config.DiscoveryMaxStale, false)
+	ensureConsistency(t, a, "/v1/catalog/service/one", a.config.DiscoveryMaxStale, false)
+	ensureConsistency(t, a, "/v1/catalog/services", a.config.DiscoveryMaxStale, false)
+
+	// Query path should be taken into account
+	ensureConsistency(t, a, "/v1/catalog/services?consistent", 0, true)
+	// Since stale is added, no MaxStale should be applied
+	ensureConsistency(t, a, "/v1/catalog/services?stale", -1, false)
+	ensureConsistency(t, a, "/v1/catalog/services?leader", 0, false)
+}
+
 func TestParseConsistency_Invalid(t *testing.T) {
 	t.Parallel()
 	resp := httptest.NewRecorder()
 	var b structs.QueryOptions
 
 	req, _ := http.NewRequest("GET", "/v1/catalog/nodes?stale&consistent", nil)
-	if d := parseConsistency(resp, req, &b); !d {
+	a := NewTestAgent(t.Name(), "")
+	defer a.Shutdown()
+	if d := a.srv.parseConsistency(resp, req, &b); !d {
 		t.Fatalf("expected done")
 	}
 
@@ -760,6 +975,40 @@ func TestACLResolution(t *testing.T) {
 	// Request with header and querystring tokens
 	reqBothTokens, _ := http.NewRequest("GET", "/v1/catalog/nodes?token=baz", nil)
 	reqBothTokens.Header.Add("X-Consul-Token", "zap")
+
+	// Request with Authorization Bearer token
+	reqAuthBearerToken, _ := http.NewRequest("GET", "/v1/catalog/nodes", nil)
+	reqAuthBearerToken.Header.Add("Authorization", "Bearer bearer-token")
+
+	// Request with invalid Authorization scheme
+	reqAuthBearerInvalidScheme, _ := http.NewRequest("GET", "/v1/catalog/nodes", nil)
+	reqAuthBearerInvalidScheme.Header.Add("Authorization", "Beer")
+
+	// Request with empty Authorization Bearer token
+	reqAuthBearerTokenEmpty, _ := http.NewRequest("GET", "/v1/catalog/nodes", nil)
+	reqAuthBearerTokenEmpty.Header.Add("Authorization", "Bearer")
+
+	// Request with empty Authorization Bearer token
+	reqAuthBearerTokenInvalid, _ := http.NewRequest("GET", "/v1/catalog/nodes", nil)
+	reqAuthBearerTokenInvalid.Header.Add("Authorization", "Bearertoken")
+
+	// Request with more than one space between Bearer and token
+	reqAuthBearerTokenMultiSpaces, _ := http.NewRequest("GET", "/v1/catalog/nodes", nil)
+	reqAuthBearerTokenMultiSpaces.Header.Add("Authorization", "Bearer     bearer-token")
+
+	// Request with Authorization Bearer token containing spaces
+	reqAuthBearerTokenSpaces, _ := http.NewRequest("GET", "/v1/catalog/nodes", nil)
+	reqAuthBearerTokenSpaces.Header.Add("Authorization", "Bearer bearer-token "+
+		" the rest is discarded   ")
+
+	// Request with Authorization Bearer and querystring token
+	reqAuthBearerAndQsToken, _ := http.NewRequest("GET", "/v1/catalog/nodes?token=qstoken", nil)
+	reqAuthBearerAndQsToken.Header.Add("Authorization", "Bearer bearer-token")
+
+	// Request with Authorization Bearer and X-Consul-Token header token
+	reqAuthBearerAndXToken, _ := http.NewRequest("GET", "/v1/catalog/nodes", nil)
+	reqAuthBearerAndXToken.Header.Add("X-Consul-Token", "xtoken")
+	reqAuthBearerAndXToken.Header.Add("Authorization", "Bearer bearer-token")
 
 	a := NewTestAgent(t.Name(), "")
 	defer a.Shutdown()
@@ -795,6 +1044,58 @@ func TestACLResolution(t *testing.T) {
 	if token != "baz" {
 		t.Fatalf("bad: %s", token)
 	}
+
+	//
+	// Authorization Bearer token tests
+	//
+
+	// Check if Authorization bearer token header is parsed correctly
+	a.srv.parseToken(reqAuthBearerToken, &token)
+	if token != "bearer-token" {
+		t.Fatalf("bad: %s", token)
+	}
+
+	// Check Authorization Bearer scheme invalid
+	a.srv.parseToken(reqAuthBearerInvalidScheme, &token)
+	if token != "agent" {
+		t.Fatalf("bad: %s", token)
+	}
+
+	// Check if Authorization Bearer token is empty
+	a.srv.parseToken(reqAuthBearerTokenEmpty, &token)
+	if token != "agent" {
+		t.Fatalf("bad: %s", token)
+	}
+
+	// Check if the Authorization Bearer token is invalid
+	a.srv.parseToken(reqAuthBearerTokenInvalid, &token)
+	if token != "agent" {
+		t.Fatalf("bad: %s", token)
+	}
+
+	// Check multi spaces between Authorization Bearer and token value
+	a.srv.parseToken(reqAuthBearerTokenMultiSpaces, &token)
+	if token != "bearer-token" {
+		t.Fatalf("bad: %s", token)
+	}
+
+	// Check if Authorization Bearer token with spaces is parsed correctly
+	a.srv.parseToken(reqAuthBearerTokenSpaces, &token)
+	if token != "bearer-token" {
+		t.Fatalf("bad: %s", token)
+	}
+
+	// Check if explicit token has precedence over Authorization bearer token
+	a.srv.parseToken(reqAuthBearerAndQsToken, &token)
+	if token != "qstoken" {
+		t.Fatalf("bad: %s", token)
+	}
+
+	// Check if X-Consul-Token has precedence over Authorization bearer token
+	a.srv.parseToken(reqAuthBearerAndXToken, &token)
+	if token != "xtoken" {
+		t.Fatalf("bad: %s", token)
+	}
 }
 
 func TestEnableWebUI(t *testing.T) {
@@ -809,6 +1110,97 @@ func TestEnableWebUI(t *testing.T) {
 	a.srv.Handler.ServeHTTP(resp, req)
 	if resp.Code != 200 {
 		t.Fatalf("should handle ui")
+	}
+}
+
+func TestParseToken_ProxyTokenResolve(t *testing.T) {
+	t.Parallel()
+
+	type endpointCheck struct {
+		endpoint string
+		handler  func(s *HTTPServer, resp http.ResponseWriter, req *http.Request) (interface{}, error)
+	}
+
+	// This is not an exhaustive list of all of our endpoints and is only testing GET endpoints
+	// right now. However it provides decent coverage that the proxy token resolution
+	// is happening properly
+	tests := []endpointCheck{
+		{"/v1/acl/info/root", (*HTTPServer).ACLGet},
+		{"/v1/agent/self", (*HTTPServer).AgentSelf},
+		{"/v1/agent/metrics", (*HTTPServer).AgentMetrics},
+		{"/v1/agent/services", (*HTTPServer).AgentServices},
+		{"/v1/agent/checks", (*HTTPServer).AgentChecks},
+		{"/v1/agent/members", (*HTTPServer).AgentMembers},
+		{"/v1/agent/connect/ca/roots", (*HTTPServer).AgentConnectCARoots},
+		{"/v1/agent/connect/ca/leaf/test", (*HTTPServer).AgentConnectCALeafCert},
+		{"/v1/agent/connect/ca/proxy/test", (*HTTPServer).AgentConnectProxyConfig},
+		{"/v1/catalog/connect", (*HTTPServer).CatalogConnectServiceNodes},
+		{"/v1/catalog/datacenters", (*HTTPServer).CatalogDatacenters},
+		{"/v1/catalog/nodes", (*HTTPServer).CatalogNodes},
+		{"/v1/catalog/node/" + t.Name(), (*HTTPServer).CatalogNodeServices},
+		{"/v1/catalog/services", (*HTTPServer).CatalogServices},
+		{"/v1/catalog/service/test", (*HTTPServer).CatalogServiceNodes},
+		{"/v1/connect/ca/configuration", (*HTTPServer).ConnectCAConfiguration},
+		{"/v1/connect/ca/roots", (*HTTPServer).ConnectCARoots},
+		{"/v1/connect/intentions", (*HTTPServer).IntentionEndpoint},
+		{"/v1/coordinate/datacenters", (*HTTPServer).CoordinateDatacenters},
+		{"/v1/coordinate/nodes", (*HTTPServer).CoordinateNodes},
+		{"/v1/coordinate/node/" + t.Name(), (*HTTPServer).CoordinateNode},
+		{"/v1/event/list", (*HTTPServer).EventList},
+		{"/v1/health/node/" + t.Name(), (*HTTPServer).HealthNodeChecks},
+		{"/v1/health/checks/test", (*HTTPServer).HealthNodeChecks},
+		{"/v1/health/state/passing", (*HTTPServer).HealthChecksInState},
+		{"/v1/health/service/test", (*HTTPServer).HealthServiceNodes},
+		{"/v1/health/connect/test", (*HTTPServer).HealthConnectServiceNodes},
+		{"/v1/operator/raft/configuration", (*HTTPServer).OperatorRaftConfiguration},
+		// keyring endpoint has issues with returning errors if you haven't enabled encryption
+		// {"/v1/operator/keyring", (*HTTPServer).OperatorKeyringEndpoint},
+		{"/v1/operator/autopilot/configuration", (*HTTPServer).OperatorAutopilotConfiguration},
+		{"/v1/operator/autopilot/health", (*HTTPServer).OperatorServerHealth},
+		{"/v1/query", (*HTTPServer).PreparedQueryGeneral},
+		{"/v1/session/list", (*HTTPServer).SessionList},
+		{"/v1/status/leader", (*HTTPServer).StatusLeader},
+		{"/v1/status/peers", (*HTTPServer).StatusPeers},
+	}
+
+	a := NewTestAgent(t.Name(), TestACLConfig()+testAllowProxyConfig())
+	defer a.Shutdown()
+
+	// Register a service with a managed proxy
+	{
+		reg := &structs.ServiceDefinition{
+			ID:      "test-id",
+			Name:    "test",
+			Address: "127.0.0.1",
+			Port:    8000,
+			Check: structs.CheckType{
+				TTL: 15 * time.Second,
+			},
+			Connect: &structs.ServiceConnect{
+				Proxy: &structs.ServiceDefinitionConnectProxy{},
+			},
+		}
+
+		req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=root", jsonReader(reg))
+		resp := httptest.NewRecorder()
+		_, err := a.srv.AgentRegisterService(resp, req)
+		require.NoError(t, err)
+		require.Equal(t, 200, resp.Code, "body: %s", resp.Body.String())
+	}
+
+	// Get the proxy token from the agent directly, since there is no API.
+	proxy := a.State.Proxy("test-id-proxy")
+	require.NotNil(t, proxy)
+	token := proxy.ProxyToken
+	require.NotEmpty(t, token)
+
+	for _, check := range tests {
+		t.Run(fmt.Sprintf("GET(%s)", check.endpoint), func(t *testing.T) {
+			req, _ := http.NewRequest("GET", fmt.Sprintf("%s?token=%s", check.endpoint, token), nil)
+			resp := httptest.NewRecorder()
+			_, err := check.handler(a.srv, resp, req)
+			require.NoError(t, err)
+		})
 	}
 }
 

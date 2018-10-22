@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/agent/metadata"
+	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
@@ -37,7 +38,9 @@ func (s *Server) setupSerf(conf *serf.Config, ch chan serf.Event, path string, w
 		conf.NodeName = fmt.Sprintf("%s.%s", s.config.NodeName, s.config.Datacenter)
 	} else {
 		conf.NodeName = s.config.NodeName
-		conf.Tags["wan_join_port"] = fmt.Sprintf("%d", wanPort)
+		if wanPort > 0 {
+			conf.Tags["wan_join_port"] = fmt.Sprintf("%d", wanPort)
+		}
 	}
 	conf.Tags["role"] = "consul"
 	conf.Tags["dc"] = s.config.Datacenter
@@ -66,6 +69,13 @@ func (s *Server) setupSerf(conf *serf.Config, ch chan serf.Event, path string, w
 	}
 	if s.config.UseTLS {
 		conf.Tags["use_tls"] = "1"
+	}
+
+	if s.config.ACLDatacenter != "" {
+		// we start in legacy mode and allow upgrading later
+		conf.Tags["acls"] = string(structs.ACLModeLegacy)
+	} else {
+		conf.Tags["acls"] = string(structs.ACLModeDisabled)
 	}
 	if s.logger == nil {
 		conf.MemberlistConfig.LogOutput = s.config.LogOutput
@@ -196,7 +206,9 @@ func (s *Server) localEvent(event serf.UserEvent) {
 			s.config.UserEventHandler(event)
 		}
 	default:
-		s.logger.Printf("[WARN] consul: Unhandled local event: %v", event)
+		if !s.handleEnterpriseUserEvents(event) {
+			s.logger.Printf("[WARN] consul: Unhandled local event: %v", event)
+		}
 	}
 }
 
@@ -241,6 +253,7 @@ func (s *Server) maybeBootstrap() {
 	// Scan for all the known servers.
 	members := s.serfLAN.Members()
 	var servers []metadata.Server
+	voters := 0
 	for _, member := range members {
 		valid, p := metadata.IsConsulServer(member)
 		if !valid {
@@ -258,11 +271,14 @@ func (s *Server) maybeBootstrap() {
 			s.logger.Printf("[ERR] consul: Member %v has bootstrap mode. Expect disabled.", member)
 			return
 		}
+		if !p.NonVoter {
+			voters++
+		}
 		servers = append(servers, *p)
 	}
 
 	// Skip if we haven't met the minimum expect count.
-	if len(servers) < s.config.BootstrapExpect {
+	if voters < s.config.BootstrapExpect {
 		return
 	}
 
@@ -304,7 +320,7 @@ func (s *Server) maybeBootstrap() {
 	// Attempt a live bootstrap!
 	var configuration raft.Configuration
 	var addrs []string
-	minRaftVersion, err := ServerMinRaftProtocol(members)
+	minRaftVersion, err := s.autopilot.MinRaftProtocol()
 	if err != nil {
 		s.logger.Printf("[ERR] consul: Failed to read server raft versions: %v", err)
 	}
@@ -318,9 +334,14 @@ func (s *Server) maybeBootstrap() {
 		} else {
 			id = raft.ServerID(addr)
 		}
+		suffrage := raft.Voter
+		if server.NonVoter {
+			suffrage = raft.Nonvoter
+		}
 		peer := raft.Server{
-			ID:      id,
-			Address: raft.ServerAddress(addr),
+			ID:       id,
+			Address:  raft.ServerAddress(addr),
+			Suffrage: suffrage,
 		}
 		configuration.Servers = append(configuration.Servers, peer)
 	}

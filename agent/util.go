@@ -61,12 +61,11 @@ func setFilePermissions(path string, user, group, mode string) error {
 		}
 
 		// Try looking up the user by name
-		if u, err := osuser.Lookup(user); err == nil {
-			uid, _ = strconv.Atoi(u.Uid)
-			goto GROUP
+		u, err := osuser.Lookup(user)
+		if err != nil {
+			return fmt.Errorf("failed to look up user %s: %v", user, err)
 		}
-
-		return fmt.Errorf("invalid user specified: %v", user)
+		uid, _ = strconv.Atoi(u.Uid)
 	}
 
 GROUP:
@@ -99,7 +98,7 @@ GROUP:
 func ForwardSignals(cmd *exec.Cmd, logFn func(error), shutdownCh <-chan struct{}) {
 	go func() {
 		signalCh := make(chan os.Signal, 10)
-		signal.Notify(signalCh, os.Interrupt, os.Kill)
+		signal.Notify(signalCh, forwardSignals...)
 		defer signal.Stop(signalCh)
 
 		for {

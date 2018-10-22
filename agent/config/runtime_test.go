@@ -19,10 +19,11 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/testutil"
 	"github.com/hashicorp/consul/types"
 	"github.com/pascaldekloe/goe/verify"
-	"github.com/sergi/go-diff/diffmatchpatch"
+	"github.com/stretchr/testify/require"
 )
 
 type configTest struct {
@@ -31,6 +32,7 @@ type configTest struct {
 	pre, post      func()
 	json, jsontail []string
 	hcl, hcltail   []string
+	skipformat     bool
 	privatev4      func() ([]*net.IPAddr, error)
 	publicv6       func() ([]*net.IPAddr, error)
 	patch          func(rt *RuntimeConfig)
@@ -263,6 +265,7 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				rt.AdvertiseAddrLAN = ipAddr("127.0.0.1")
 				rt.AdvertiseAddrWAN = ipAddr("127.0.0.1")
 				rt.BindAddr = ipAddr("127.0.0.1")
+				rt.ConnectEnabled = true
 				rt.DevMode = true
 				rt.DisableAnonymousSignature = true
 				rt.DisableKeyringFile = true
@@ -283,15 +286,17 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				rt.ConsulRaftElectionTimeout = 52 * time.Millisecond
 				rt.ConsulRaftHeartbeatTimeout = 35 * time.Millisecond
 				rt.ConsulRaftLeaderLeaseTimeout = 20 * time.Millisecond
-				rt.ConsulSerfLANGossipInterval = 100 * time.Millisecond
-				rt.ConsulSerfLANProbeInterval = 100 * time.Millisecond
-				rt.ConsulSerfLANProbeTimeout = 100 * time.Millisecond
-				rt.ConsulSerfLANSuspicionMult = 3
-				rt.ConsulSerfWANGossipInterval = 100 * time.Millisecond
-				rt.ConsulSerfWANProbeInterval = 100 * time.Millisecond
-				rt.ConsulSerfWANProbeTimeout = 100 * time.Millisecond
-				rt.ConsulSerfWANSuspicionMult = 3
+				rt.GossipLANGossipInterval = 100 * time.Millisecond
+				rt.GossipLANProbeInterval = 100 * time.Millisecond
+				rt.GossipLANProbeTimeout = 100 * time.Millisecond
+				rt.GossipLANSuspicionMult = 3
+				rt.GossipWANGossipInterval = 100 * time.Millisecond
+				rt.GossipWANProbeInterval = 100 * time.Millisecond
+				rt.GossipWANProbeTimeout = 100 * time.Millisecond
+				rt.GossipWANSuspicionMult = 3
 				rt.ConsulServerHealthInterval = 10 * time.Millisecond
+				rt.GRPCPort = 8502
+				rt.GRPCAddrs = []net.Addr{tcpAddr("127.0.0.1:8502")}
 			},
 		},
 		{
@@ -346,7 +351,8 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				`-data-dir=` + dataDir,
 			},
 			patch: func(rt *RuntimeConfig) {
-				rt.EnableScriptChecks = true
+				rt.EnableLocalScriptChecks = true
+				rt.EnableRemoteScriptChecks = true
 				rt.DataDir = dataDir
 			},
 		},
@@ -641,6 +647,19 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			},
 		},
 		{
+			desc: "-serf-lan-port",
+			args: []string{
+				`-serf-lan-port=123`,
+				`-data-dir=` + dataDir,
+			},
+			patch: func(rt *RuntimeConfig) {
+				rt.SerfPortLAN = 123
+				rt.SerfAdvertiseAddrLAN = tcpAddr("10.0.0.1:123")
+				rt.SerfBindAddrLAN = tcpAddr("0.0.0.0:123")
+				rt.DataDir = dataDir
+			},
+		},
+		{
 			desc: "-serf-wan-bind",
 			args: []string{
 				`-serf-wan-bind=1.2.3.4`,
@@ -648,6 +667,19 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			},
 			patch: func(rt *RuntimeConfig) {
 				rt.SerfBindAddrWAN = tcpAddr("1.2.3.4:8302")
+				rt.DataDir = dataDir
+			},
+		},
+		{
+			desc: "-serf-wan-port",
+			args: []string{
+				`-serf-wan-port=123`,
+				`-data-dir=` + dataDir,
+			},
+			patch: func(rt *RuntimeConfig) {
+				rt.SerfPortWAN = 123
+				rt.SerfAdvertiseAddrWAN = tcpAddr("10.0.0.1:123")
+				rt.SerfBindAddrWAN = tcpAddr("0.0.0.0:123")
 				rt.DataDir = dataDir
 			},
 		},
@@ -661,6 +693,19 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				rt.ServerMode = true
 				rt.LeaveOnTerm = false
 				rt.SkipLeaveOnInt = true
+				rt.DataDir = dataDir
+			},
+		},
+		{
+			desc: "-server-port",
+			args: []string{
+				`-server-port=123`,
+				`-data-dir=` + dataDir,
+			},
+			patch: func(rt *RuntimeConfig) {
+				rt.ServerPort = 123
+				rt.RPCAdvertiseAddr = tcpAddr("10.0.0.1:123")
+				rt.RPCBindAddr = tcpAddr("0.0.0.0:123")
 				rt.DataDir = dataDir
 			},
 		},
@@ -797,11 +842,11 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			args: []string{`-data-dir=` + dataDir},
 			json: []string{`{
 					"client_addr":"0.0.0.0",
-					"ports": { "dns":-1, "http":-2, "https":-3 }
+					"ports": { "dns":-1, "http":-2, "https":-3, "grpc":-4 }
 				}`},
 			hcl: []string{`
 					client_addr = "0.0.0.0"
-					ports { dns = -1 http = -2 https = -3 }
+					ports { dns = -1 http = -2 https = -3 grpc = -4 }
 				`},
 			patch: func(rt *RuntimeConfig) {
 				rt.ClientAddrs = []*net.IPAddr{ipAddr("0.0.0.0")}
@@ -809,6 +854,8 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				rt.DNSAddrs = nil
 				rt.HTTPPort = -1
 				rt.HTTPAddrs = nil
+				// HTTPS and gRPC default to disabled so shouldn't be different from
+				// default rt.
 				rt.DataDir = dataDir
 			},
 		},
@@ -817,11 +864,11 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			args: []string{`-data-dir=` + dataDir},
 			json: []string{`{
 					"client_addr":"0.0.0.0",
-					"ports":{ "dns": 1, "http": 2, "https": 3 }
+					"ports":{ "dns": 1, "http": 2, "https": 3, "grpc": 4 }
 				}`},
 			hcl: []string{`
 					client_addr = "0.0.0.0"
-					ports { dns = 1 http = 2 https = 3 }
+					ports { dns = 1 http = 2 https = 3 grpc = 4 }
 				`},
 			patch: func(rt *RuntimeConfig) {
 				rt.ClientAddrs = []*net.IPAddr{ipAddr("0.0.0.0")}
@@ -831,6 +878,8 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				rt.HTTPAddrs = []net.Addr{tcpAddr("0.0.0.0:2")}
 				rt.HTTPSPort = 3
 				rt.HTTPSAddrs = []net.Addr{tcpAddr("0.0.0.0:3")}
+				rt.GRPCPort = 4
+				rt.GRPCAddrs = []net.Addr{tcpAddr("0.0.0.0:4")}
 				rt.DataDir = dataDir
 			},
 		},
@@ -840,18 +889,20 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			args: []string{`-data-dir=` + dataDir},
 			json: []string{`{
 					"client_addr":"0.0.0.0",
-					"addresses": { "dns": "1.1.1.1", "http": "2.2.2.2", "https": "3.3.3.3" },
+					"addresses": { "dns": "1.1.1.1", "http": "2.2.2.2", "https": "3.3.3.3", "grpc": "4.4.4.4" },
 					"ports":{}
 				}`},
 			hcl: []string{`
 					client_addr = "0.0.0.0"
-					addresses = { dns = "1.1.1.1" http = "2.2.2.2" https = "3.3.3.3" }
+					addresses = { dns = "1.1.1.1" http = "2.2.2.2" https = "3.3.3.3" grpc = "4.4.4.4" }
 					ports {}
 				`},
 			patch: func(rt *RuntimeConfig) {
 				rt.ClientAddrs = []*net.IPAddr{ipAddr("0.0.0.0")}
 				rt.DNSAddrs = []net.Addr{tcpAddr("1.1.1.1:8600"), udpAddr("1.1.1.1:8600")}
 				rt.HTTPAddrs = []net.Addr{tcpAddr("2.2.2.2:8500")}
+				// HTTPS and gRPC default to disabled so shouldn't be different from
+				// default rt.
 				rt.DataDir = dataDir
 			},
 		},
@@ -860,13 +911,13 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			args: []string{`-data-dir=` + dataDir},
 			json: []string{`{
 					"client_addr":"0.0.0.0",
-					"addresses": { "dns": "1.1.1.1", "http": "2.2.2.2", "https": "3.3.3.3" },
-					"ports": { "dns":-1, "http":-2, "https":-3 }
+					"addresses": { "dns": "1.1.1.1", "http": "2.2.2.2", "https": "3.3.3.3", "grpc": "4.4.4.4" },
+					"ports": { "dns":-1, "http":-2, "https":-3, "grpc":-4 }
 				}`},
 			hcl: []string{`
 					client_addr = "0.0.0.0"
-					addresses = { dns = "1.1.1.1" http = "2.2.2.2" https = "3.3.3.3" }
-					ports { dns = -1 http = -2 https = -3 }
+					addresses = { dns = "1.1.1.1" http = "2.2.2.2" https = "3.3.3.3" grpc = "4.4.4.4" }
+					ports { dns = -1 http = -2 https = -3 grpc = -4 }
 				`},
 			patch: func(rt *RuntimeConfig) {
 				rt.ClientAddrs = []*net.IPAddr{ipAddr("0.0.0.0")}
@@ -874,6 +925,8 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				rt.DNSAddrs = nil
 				rt.HTTPPort = -1
 				rt.HTTPAddrs = nil
+				// HTTPS and gRPC default to disabled so shouldn't be different from
+				// default rt.
 				rt.DataDir = dataDir
 			},
 		},
@@ -882,13 +935,13 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			args: []string{`-data-dir=` + dataDir},
 			json: []string{`{
 					"client_addr": "0.0.0.0",
-					"addresses": { "dns": "1.1.1.1", "http": "2.2.2.2", "https": "3.3.3.3" },
-					"ports":{ "dns":1, "http":2, "https":3 }
+					"addresses": { "dns": "1.1.1.1", "http": "2.2.2.2", "https": "3.3.3.3", "grpc": "4.4.4.4" },
+					"ports":{ "dns":1, "http":2, "https":3, "grpc":4 }
 				}`},
 			hcl: []string{`
 					client_addr = "0.0.0.0"
-					addresses = { dns = "1.1.1.1" http = "2.2.2.2" https = "3.3.3.3" }
-					ports { dns = 1 http = 2 https = 3 }
+					addresses = { dns = "1.1.1.1" http = "2.2.2.2" https = "3.3.3.3" grpc = "4.4.4.4" }
+					ports { dns = 1 http = 2 https = 3 grpc = 4 }
 				`},
 			patch: func(rt *RuntimeConfig) {
 				rt.ClientAddrs = []*net.IPAddr{ipAddr("0.0.0.0")}
@@ -898,6 +951,8 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				rt.HTTPAddrs = []net.Addr{tcpAddr("2.2.2.2:2")}
 				rt.HTTPSPort = 3
 				rt.HTTPSAddrs = []net.Addr{tcpAddr("3.3.3.3:3")}
+				rt.GRPCPort = 4
+				rt.GRPCAddrs = []net.Addr{tcpAddr("4.4.4.4:4")}
 				rt.DataDir = dataDir
 			},
 		},
@@ -906,11 +961,11 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			args: []string{`-data-dir=` + dataDir},
 			json: []string{`{
 					"client_addr": "{{ printf \"1.2.3.4 2001:db8::1\" }}",
-					"ports":{ "dns":1, "http":2, "https":3 }
+					"ports":{ "dns":1, "http":2, "https":3, "grpc":4 }
 				}`},
 			hcl: []string{`
 					client_addr = "{{ printf \"1.2.3.4 2001:db8::1\" }}"
-					ports { dns = 1 http = 2 https = 3 }
+					ports { dns = 1 http = 2 https = 3 grpc = 4 }
 				`},
 			patch: func(rt *RuntimeConfig) {
 				rt.ClientAddrs = []*net.IPAddr{ipAddr("1.2.3.4"), ipAddr("2001:db8::1")}
@@ -920,6 +975,8 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				rt.HTTPAddrs = []net.Addr{tcpAddr("1.2.3.4:2"), tcpAddr("[2001:db8::1]:2")}
 				rt.HTTPSPort = 3
 				rt.HTTPSAddrs = []net.Addr{tcpAddr("1.2.3.4:3"), tcpAddr("[2001:db8::1]:3")}
+				rt.GRPCPort = 4
+				rt.GRPCAddrs = []net.Addr{tcpAddr("1.2.3.4:4"), tcpAddr("[2001:db8::1]:4")}
 				rt.DataDir = dataDir
 			},
 		},
@@ -931,9 +988,10 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 					"addresses": {
 						"dns": "{{ printf \"1.1.1.1 2001:db8::10 \" }}",
 						"http": "{{ printf \"2.2.2.2 unix://http 2001:db8::20 \" }}",
-						"https": "{{ printf \"3.3.3.3 unix://https 2001:db8::30 \" }}"
+						"https": "{{ printf \"3.3.3.3 unix://https 2001:db8::30 \" }}",
+						"grpc": "{{ printf \"4.4.4.4 unix://grpc 2001:db8::40 \" }}"
 					},
-					"ports":{ "dns":1, "http":2, "https":3 }
+					"ports":{ "dns":1, "http":2, "https":3, "grpc":4 }
 				}`},
 			hcl: []string{`
 					client_addr = "{{ printf \"1.2.3.4 2001:db8::1\" }}"
@@ -941,8 +999,9 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 						dns = "{{ printf \"1.1.1.1 2001:db8::10 \" }}"
 						http = "{{ printf \"2.2.2.2 unix://http 2001:db8::20 \" }}"
 						https = "{{ printf \"3.3.3.3 unix://https 2001:db8::30 \" }}"
+						grpc = "{{ printf \"4.4.4.4 unix://grpc 2001:db8::40 \" }}"
 					}
-					ports { dns = 1 http = 2 https = 3 }
+					ports { dns = 1 http = 2 https = 3 grpc = 4 }
 				`},
 			patch: func(rt *RuntimeConfig) {
 				rt.ClientAddrs = []*net.IPAddr{ipAddr("1.2.3.4"), ipAddr("2001:db8::1")}
@@ -952,6 +1011,8 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				rt.HTTPAddrs = []net.Addr{tcpAddr("2.2.2.2:2"), unixAddr("unix://http"), tcpAddr("[2001:db8::20]:2")}
 				rt.HTTPSPort = 3
 				rt.HTTPSAddrs = []net.Addr{tcpAddr("3.3.3.3:3"), unixAddr("unix://https"), tcpAddr("[2001:db8::30]:3")}
+				rt.GRPCPort = 4
+				rt.GRPCAddrs = []net.Addr{tcpAddr("4.4.4.4:4"), unixAddr("unix://grpc"), tcpAddr("[2001:db8::40]:4")}
 				rt.DataDir = dataDir
 			},
 		},
@@ -1065,6 +1126,33 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			},
 		},
 		{
+			desc: "allow disabling serf wan port",
+			args: []string{`-data-dir=` + dataDir},
+			json: []string{`{
+				"ports": {
+					"serf_wan": -1
+				},
+				"advertise_addr_wan": "1.2.3.4"
+			}`},
+			hcl: []string{`
+				ports {
+					serf_wan = -1
+				}
+				advertise_addr_wan = "1.2.3.4"
+			`},
+			patch: func(rt *RuntimeConfig) {
+				rt.AdvertiseAddrWAN = ipAddr("1.2.3.4")
+				rt.SerfAdvertiseAddrWAN = nil
+				rt.SerfBindAddrWAN = nil
+				rt.TaggedAddresses = map[string]string{
+					"lan": "10.0.0.1",
+					"wan": "1.2.3.4",
+				}
+				rt.DataDir = dataDir
+				rt.SerfPortWAN = -1
+			},
+		},
+		{
 			desc: "serf bind address lan template",
 			args: []string{`-data-dir=` + dataDir},
 			json: []string{`{ "serf_lan": "{{ printf \"1.2.3.4\" }}" }`},
@@ -1094,6 +1182,46 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				rt.DataDir = dataDir
 			},
 		},
+		{
+			desc: "start_join address template",
+			args: []string{`-data-dir=` + dataDir},
+			json: []string{`{ "start_join": ["{{ printf \"1.2.3.4 4.3.2.1\" }}"] }`},
+			hcl:  []string{`start_join = ["{{ printf \"1.2.3.4 4.3.2.1\" }}"]`},
+			patch: func(rt *RuntimeConfig) {
+				rt.StartJoinAddrsLAN = []string{"1.2.3.4", "4.3.2.1"}
+				rt.DataDir = dataDir
+			},
+		},
+		{
+			desc: "start_join_wan address template",
+			args: []string{`-data-dir=` + dataDir},
+			json: []string{`{ "start_join_wan": ["{{ printf \"1.2.3.4 4.3.2.1\" }}"] }`},
+			hcl:  []string{`start_join_wan = ["{{ printf \"1.2.3.4 4.3.2.1\" }}"]`},
+			patch: func(rt *RuntimeConfig) {
+				rt.StartJoinAddrsWAN = []string{"1.2.3.4", "4.3.2.1"}
+				rt.DataDir = dataDir
+			},
+		},
+		{
+			desc: "retry_join address template",
+			args: []string{`-data-dir=` + dataDir},
+			json: []string{`{ "retry_join": ["{{ printf \"1.2.3.4 4.3.2.1\" }}"] }`},
+			hcl:  []string{`retry_join = ["{{ printf \"1.2.3.4 4.3.2.1\" }}"]`},
+			patch: func(rt *RuntimeConfig) {
+				rt.RetryJoinLAN = []string{"1.2.3.4", "4.3.2.1"}
+				rt.DataDir = dataDir
+			},
+		},
+		{
+			desc: "retry_join_wan address template",
+			args: []string{`-data-dir=` + dataDir},
+			json: []string{`{ "retry_join_wan": ["{{ printf \"1.2.3.4 4.3.2.1\" }}"] }`},
+			hcl:  []string{`retry_join_wan = ["{{ printf \"1.2.3.4 4.3.2.1\" }}"]`},
+			patch: func(rt *RuntimeConfig) {
+				rt.RetryJoinWAN = []string{"1.2.3.4", "4.3.2.1"}
+				rt.DataDir = dataDir
+			},
+		},
 
 		// ------------------------------------------------------------
 		// precedence rules
@@ -1115,7 +1243,7 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 						"bootstrap_expect": 0,
 						"datacenter":"b",
 						"start_join": ["c", "d"],
-						"node_meta": {"c":"d"}
+						"node_meta": {"a":"c"}
 					}`,
 			},
 			hcl: []string{
@@ -1131,7 +1259,7 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 					bootstrap_expect = 0
 					datacenter = "b"
 					start_join = ["c", "d"]
-					node_meta = { "c" = "d" }
+					node_meta = { "a" = "c" }
 					`,
 			},
 			patch: func(rt *RuntimeConfig) {
@@ -1139,7 +1267,7 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				rt.BootstrapExpect = 0
 				rt.Datacenter = "b"
 				rt.StartJoinAddrsLAN = []string{"a", "b", "c", "d"}
-				rt.NodeMeta = map[string]string{"c": "d"}
+				rt.NodeMeta = map[string]string{"a": "c"}
 				rt.DataDir = dataDir
 			},
 		},
@@ -1181,7 +1309,7 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				`-datacenter=b`,
 				`-data-dir=` + dataDir,
 				`-join`, `c`, `-join=d`,
-				`-node-meta=c:d`,
+				`-node-meta=a:c`,
 				`-recursor`, `1.2.3.6`, `-recursor=5.6.7.10`,
 				`-serf-lan-bind=3.3.3.3`,
 				`-serf-wan-bind=4.4.4.4`,
@@ -1194,7 +1322,7 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				rt.SerfAdvertiseAddrWAN = tcpAddr("2.2.2.2:8302")
 				rt.Datacenter = "b"
 				rt.DNSRecursors = []string{"1.2.3.6", "5.6.7.10", "1.2.3.5", "5.6.7.9"}
-				rt.NodeMeta = map[string]string{"c": "d"}
+				rt.NodeMeta = map[string]string{"a": "c"}
 				rt.SerfBindAddrLAN = tcpAddr("3.3.3.3:8301")
 				rt.SerfBindAddrWAN = tcpAddr("4.4.4.4:8302")
 				rt.StartJoinAddrsLAN = []string{"c", "d", "a", "b"}
@@ -1250,9 +1378,12 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			json: []string{`{ "acl_datacenter": "A" }`},
 			hcl:  []string{`acl_datacenter = "A"`},
 			patch: func(rt *RuntimeConfig) {
+				rt.ACLsEnabled = true
 				rt.ACLDatacenter = "a"
 				rt.DataDir = dataDir
+				rt.PrimaryDatacenter = "a"
 			},
+			warns: []string{`The 'acl_datacenter' field is deprecated. Use the 'primary_datacenter' field instead.`},
 		},
 		{
 			desc: "acl_replication_token enables acl replication",
@@ -1261,7 +1392,7 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			hcl:  []string{`acl_replication_token = "a"`},
 			patch: func(rt *RuntimeConfig) {
 				rt.ACLReplicationToken = "a"
-				rt.EnableACLReplication = true
+				rt.ACLTokenReplication = true
 				rt.DataDir = dataDir
 			},
 		},
@@ -1345,9 +1476,10 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				`-datacenter=a`,
 				`-data-dir=` + dataDir,
 			},
-			json: []string{`{ "acl_datacenter": "%" }`},
-			hcl:  []string{`acl_datacenter = "%"`},
-			err:  `acl_datacenter cannot be "%". Please use only [a-z0-9-_]`,
+			json:  []string{`{ "acl_datacenter": "%" }`},
+			hcl:   []string{`acl_datacenter = "%"`},
+			err:   `acl_datacenter cannot be "%". Please use only [a-z0-9-_]`,
+			warns: []string{`The 'acl_datacenter' field is deprecated. Use the 'primary_datacenter' field instead.`},
 		},
 		{
 			desc: "autopilot.max_trailing_logs invalid",
@@ -1579,6 +1711,15 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			err:  "dns_config.udp_answer_limit cannot be -1. Must be greater than or equal to zero",
 		},
 		{
+			desc: "dns_config.a_record_limit invalid",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{`{ "dns_config": { "a_record_limit": -1 } }`},
+			hcl:  []string{`dns_config = { a_record_limit = -1 }`},
+			err:  "dns_config.a_record_limit cannot be -1. Must be greater than or equal to zero",
+		},
+		{
 			desc: "performance.raft_multiplier < 0",
 			args: []string{
 				`-data-dir=` + dataDir,
@@ -1746,6 +1887,103 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			err: "Serf Advertise WAN address 10.0.0.1:1000 already configured for RPC Advertise",
 		},
 		{
+			desc: "sidecar_service can't have ID",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{`{
+				  "service": {
+						"name": "web",
+						"port": 1234,
+						"connect": {
+							"sidecar_service": {
+								"ID": "random-sidecar-id"
+							}
+						}
+					}
+				}`},
+			hcl: []string{`
+				service {
+					name = "web"
+					port = 1234
+					connect {
+						sidecar_service {
+							ID = "random-sidecar-id"
+						}
+					}
+				}
+			`},
+			err: "sidecar_service can't specify an ID",
+		},
+		{
+			desc: "sidecar_service can't have nested sidecar",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{`{
+				  "service": {
+						"name": "web",
+						"port": 1234,
+						"connect": {
+							"sidecar_service": {
+								"connect": {
+									"sidecar_service": {}
+								}
+							}
+						}
+					}
+				}`},
+			hcl: []string{`
+				service {
+					name = "web"
+					port = 1234
+					connect {
+						sidecar_service {
+							connect {
+								sidecar_service {
+								}
+							}
+						}
+					}
+				}
+			`},
+			err: "sidecar_service can't have a nested sidecar_service",
+		},
+		{
+			desc: "sidecar_service can't have managed proxy",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{`{
+				  "service": {
+						"name": "web",
+						"port": 1234,
+						"connect": {
+							"sidecar_service": {
+								"connect": {
+									"proxy": {}
+								}
+							}
+						}
+					}
+				}`},
+			hcl: []string{`
+				service {
+					name = "web"
+					port = 1234
+					connect {
+						sidecar_service {
+							connect {
+								proxy {
+								}
+							}
+						}
+					}
+				}
+			`},
+			err: "sidecar_service can't have a managed proxy",
+		},
+		{
 			desc: "telemetry.prefix_filter cannot be empty",
 			args: []string{
 				`-data-dir=` + dataDir,
@@ -1774,28 +2012,10 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				`},
 			patch: func(rt *RuntimeConfig) {
 				rt.DataDir = dataDir
-				rt.TelemetryAllowedPrefixes = []string{"foo"}
-				rt.TelemetryBlockedPrefixes = []string{"bar", "consul.consul"}
+				rt.Telemetry.AllowedPrefixes = []string{"foo"}
+				rt.Telemetry.BlockedPrefixes = []string{"bar"}
 			},
 			warns: []string{`Filter rule must begin with either '+' or '-': "nix"`},
-		},
-		{
-			desc: "telemetry.enable_deprecated_names adds allow rule for whitelist",
-			args: []string{
-				`-data-dir=` + dataDir,
-			},
-			json: []string{`{
-					"telemetry": { "enable_deprecated_names": true, "filter_default": false }
-				}`},
-			hcl: []string{`
-					telemetry = { enable_deprecated_names = true filter_default = false }
-				`},
-			patch: func(rt *RuntimeConfig) {
-				rt.DataDir = dataDir
-				rt.TelemetryFilterDefault = false
-				rt.TelemetryAllowedPrefixes = []string{"consul.consul"}
-				rt.TelemetryBlockedPrefixes = []string{}
-			},
 		},
 		{
 			desc: "encrypt has invalid key",
@@ -1847,17 +2067,53 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				`-data-dir=` + dataDir,
 			},
 			json: []string{
-				`{ "check": { "name": "a", "script": "/bin/true" } }`,
-				`{ "check": { "name": "b", "script": "/bin/false" } }`,
+				`{ "check": { "name": "a", "args": ["/bin/true"] } }`,
+				`{ "check": { "name": "b", "args": ["/bin/false"] } }`,
 			},
 			hcl: []string{
-				`check = { name = "a" script = "/bin/true" }`,
-				`check = { name = "b" script = "/bin/false" }`,
+				`check = { name = "a" args = ["/bin/true"] }`,
+				`check = { name = "b" args = ["/bin/false"] }`,
 			},
 			patch: func(rt *RuntimeConfig) {
 				rt.Checks = []*structs.CheckDefinition{
-					&structs.CheckDefinition{Name: "a", Script: "/bin/true"},
-					&structs.CheckDefinition{Name: "b", Script: "/bin/false"},
+					&structs.CheckDefinition{Name: "a", ScriptArgs: []string{"/bin/true"}},
+					&structs.CheckDefinition{Name: "b", ScriptArgs: []string{"/bin/false"}},
+				}
+				rt.DataDir = dataDir
+			},
+		},
+		{
+			desc: "grpc check",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{
+				`{ "check": { "name": "a", "grpc": "localhost:12345/foo", "grpc_use_tls": true } }`,
+			},
+			hcl: []string{
+				`check = { name = "a" grpc = "localhost:12345/foo", grpc_use_tls = true }`,
+			},
+			patch: func(rt *RuntimeConfig) {
+				rt.Checks = []*structs.CheckDefinition{
+					&structs.CheckDefinition{Name: "a", GRPC: "localhost:12345/foo", GRPCUseTLS: true},
+				}
+				rt.DataDir = dataDir
+			},
+		},
+		{
+			desc: "alias check with no node",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{
+				`{ "check": { "name": "a", "alias_service": "foo" } }`,
+			},
+			hcl: []string{
+				`check = { name = "a", alias_service = "foo" }`,
+			},
+			patch: func(rt *RuntimeConfig) {
+				rt.Checks = []*structs.CheckDefinition{
+					&structs.CheckDefinition{Name: "a", AliasService: "foo"},
 				}
 				rt.DataDir = dataDir
 			},
@@ -1869,19 +2125,64 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			},
 			json: []string{
 				`{ "service": { "name": "a", "port": 80 } }`,
-				`{ "service": { "name": "b", "port": 90 } }`,
+				`{ "service": { "name": "b", "port": 90, "meta": {"my": "value"}, "weights": {"passing": 13} } }`,
 			},
 			hcl: []string{
 				`service = { name = "a" port = 80 }`,
-				`service = { name = "b" port = 90 }`,
+				`service = { name = "b" port = 90 meta={my="value"}, weights={passing=13}}`,
 			},
 			patch: func(rt *RuntimeConfig) {
 				rt.Services = []*structs.ServiceDefinition{
-					&structs.ServiceDefinition{Name: "a", Port: 80},
-					&structs.ServiceDefinition{Name: "b", Port: 90},
+					&structs.ServiceDefinition{Name: "a", Port: 80, Weights: &structs.Weights{
+						Passing: 1,
+						Warning: 1,
+					}},
+					&structs.ServiceDefinition{Name: "b", Port: 90, Meta: map[string]string{"my": "value"}, Weights: &structs.Weights{
+						Passing: 13,
+						Warning: 1,
+					}},
 				}
 				rt.DataDir = dataDir
 			},
+		},
+		{
+			desc: "service with wrong meta: too long key",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{
+				`{ "service": { "name": "a", "port": 80, "meta": { "` + randomString(520) + `": "metaValue" } } }`,
+			},
+			hcl: []string{
+				`service = { name = "a" port = 80, meta={` + randomString(520) + `="metaValue"} }`,
+			},
+			err: `Key is too long`,
+		},
+		{
+			desc: "service with wrong meta: too long value",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{
+				`{ "service": { "name": "a", "port": 80, "meta": { "a": "` + randomString(520) + `" } } }`,
+			},
+			hcl: []string{
+				`service = { name = "a" port = 80, meta={a="` + randomString(520) + `"} }`,
+			},
+			err: `Value is too long`,
+		},
+		{
+			desc: "service with wrong meta: too many meta",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{
+				`{ "service": { "name": "a", "port": 80, "meta": { ` + metaPairs(70, "json") + `} } }`,
+			},
+			hcl: []string{
+				`service = { name = "a" port = 80 meta={` + metaPairs(70, "hcl") + `} }`,
+			},
+			err: `invalid meta for service a: Node metadata cannot contain more than 64 key`,
 		},
 		{
 			desc: "translated keys",
@@ -1893,9 +2194,9 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 					"service": {
 						"name": "a",
 						"port": 80,
-						"EnableTagOverride": true,
+						"enable_tag_override": true,
 						"check": {
-							"CheckID": "x",
+							"id": "x",
 							"name": "y",
 							"DockerContainerID": "z",
 							"DeregisterCriticalServiceAfter": "10s",
@@ -1908,9 +2209,9 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 				`service = {
 					name = "a"
 					port = 80
-					EnableTagOverride = true
+					enable_tag_override = true
 					check = {
-						CheckID = "x"
+						id = "x"
 						name = "y"
 						DockerContainerID = "z"
 						DeregisterCriticalServiceAfter = "10s"
@@ -1933,6 +2234,10 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 								ScriptArgs:                     []string{"a", "b"},
 							},
 						},
+						Weights: &structs.Weights{
+							Passing: 1,
+							Warning: 1,
+						},
 					},
 				}
 				rt.DataDir = dataDir
@@ -1951,6 +2256,367 @@ func TestConfigFlagsAndEdgecases(t *testing.T) {
 			},
 			patch: func(rt *RuntimeConfig) {
 				rt.DataDir = dataDir
+			},
+		},
+
+		{
+			desc: "Service managed proxy 'upstreams'",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{
+				`{
+						"service": {
+							"name": "web",
+							"port": 8080,
+							"connect": {
+								"proxy": {
+									"upstreams": [{
+										"destination_name": "db",
+										"local_bind_port": 1234
+									}]
+								}
+							}
+						}
+					}`,
+			},
+			hcl: []string{
+				`service {
+					name = "web"
+					port = 8080
+					connect {
+						proxy {
+							upstreams {
+								destination_name = "db"
+								local_bind_port = 1234
+							}
+						}
+					}
+				}`,
+			},
+			patch: func(rt *RuntimeConfig) {
+				rt.DataDir = dataDir
+				rt.Services = []*structs.ServiceDefinition{
+					&structs.ServiceDefinition{
+						Name: "web",
+						Port: 8080,
+						Connect: &structs.ServiceConnect{
+							Proxy: &structs.ServiceDefinitionConnectProxy{
+								Upstreams: structs.Upstreams{
+									{
+										DestinationName: "db",
+										DestinationType: structs.UpstreamDestTypeService,
+										LocalBindPort:   1234,
+									},
+								},
+							},
+						},
+						Weights: &structs.Weights{
+							Passing: 1,
+							Warning: 1,
+						},
+					},
+				}
+			},
+		},
+
+		{
+			desc: "Multiple service managed proxy 'upstreams'",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{
+				`{
+						"service": {
+							"name": "web",
+							"port": 8080,
+							"connect": {
+								"proxy": {
+									"upstreams": [{
+										"destination_name": "db",
+										"local_bind_port": 1234
+									}, {
+										"destination_name": "cache",
+										"local_bind_port": 2345
+									}]
+								}
+							}
+						}
+					}`,
+			},
+			hcl: []string{
+				`service {
+					name = "web"
+					port = 8080
+					connect {
+						proxy {
+							upstreams = [
+								{
+									destination_name = "db"
+									local_bind_port = 1234
+								},
+							  {
+									destination_name = "cache"
+									local_bind_port = 2345
+								}
+							]
+						}
+					}
+				}`,
+			},
+			patch: func(rt *RuntimeConfig) {
+				rt.DataDir = dataDir
+				rt.Services = []*structs.ServiceDefinition{
+					&structs.ServiceDefinition{
+						Name: "web",
+						Port: 8080,
+						Connect: &structs.ServiceConnect{
+							Proxy: &structs.ServiceDefinitionConnectProxy{
+								Upstreams: structs.Upstreams{
+									{
+										DestinationName: "db",
+										DestinationType: structs.UpstreamDestTypeService,
+										LocalBindPort:   1234,
+									},
+									{
+										DestinationName: "cache",
+										DestinationType: structs.UpstreamDestTypeService,
+										LocalBindPort:   2345,
+									},
+								},
+							},
+						},
+						Weights: &structs.Weights{
+							Passing: 1,
+							Warning: 1,
+						},
+					},
+				}
+			},
+		},
+
+		{
+			desc: "enabling Connect allow_managed_root",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{
+				`{ "connect": { "proxy": { "allow_managed_root": true } } }`,
+			},
+			hcl: []string{
+				`connect { proxy { allow_managed_root = true } }`,
+			},
+			patch: func(rt *RuntimeConfig) {
+				rt.DataDir = dataDir
+				rt.ConnectProxyAllowManagedRoot = true
+			},
+		},
+
+		{
+			desc: "enabling Connect allow_managed_api_registration",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{
+				`{ "connect": { "proxy": { "allow_managed_api_registration": true } } }`,
+			},
+			hcl: []string{
+				`connect { proxy { allow_managed_api_registration = true } }`,
+			},
+			patch: func(rt *RuntimeConfig) {
+				rt.DataDir = dataDir
+				rt.ConnectProxyAllowManagedAPIRegistration = true
+			},
+		},
+
+		{
+			// This tests that we correct added the nested paths to arrays of objects
+			// to the exceptions in patchSliceOfMaps in config.go (for single service)
+			desc: "service.connectsidecar_service with checks and upstreams",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{`{
+				  "service": {
+						"name": "web",
+						"port": 1234,
+						"connect": {
+							"sidecar_service": {
+								"port": 2345,
+								"checks": [
+									{
+										"TCP": "127.0.0.1:2345",
+										"Interval": "10s"
+									}
+								],
+								"proxy": {
+									"upstreams": [
+										{
+											"destination_name": "db",
+											"local_bind_port": 7000
+										}
+									]
+								}
+							}
+						}
+					}
+				}`},
+			hcl: []string{`
+				service {
+					name = "web"
+					port = 1234
+					connect {
+						sidecar_service {
+							port = 2345
+							checks = [
+								{
+									tcp = "127.0.0.1:2345"
+									interval = "10s"
+								}
+							]
+							proxy {
+								upstreams = [
+									{
+										destination_name = "db"
+										local_bind_port = 7000
+									},
+								]
+							}
+						}
+					}
+				}
+			`},
+			patch: func(rt *RuntimeConfig) {
+				rt.DataDir = dataDir
+				rt.Services = []*structs.ServiceDefinition{
+					{
+						Name: "web",
+						Port: 1234,
+						Connect: &structs.ServiceConnect{
+							SidecarService: &structs.ServiceDefinition{
+								Port: 2345,
+								Checks: structs.CheckTypes{
+									{
+										TCP:      "127.0.0.1:2345",
+										Interval: 10 * time.Second,
+									},
+								},
+								Proxy: &structs.ConnectProxyConfig{
+									Upstreams: structs.Upstreams{
+										structs.Upstream{
+											DestinationType: "service",
+											DestinationName: "db",
+											LocalBindPort:   7000,
+										},
+									},
+								},
+								Weights: &structs.Weights{
+									Passing: 1,
+									Warning: 1,
+								},
+							},
+						},
+						Weights: &structs.Weights{
+							Passing: 1,
+							Warning: 1,
+						},
+					},
+				}
+			},
+		},
+		{
+			// This tests that we correct added the nested paths to arrays of objects
+			// to the exceptions in patchSliceOfMaps in config.go (for service*s*)
+			desc: "services.connect.sidecar_service with checks and upstreams",
+			args: []string{
+				`-data-dir=` + dataDir,
+			},
+			json: []string{`{
+				  "services": [{
+						"name": "web",
+						"port": 1234,
+						"connect": {
+							"sidecar_service": {
+								"port": 2345,
+								"checks": [
+									{
+										"TCP": "127.0.0.1:2345",
+										"Interval": "10s"
+									}
+								],
+								"proxy": {
+									"upstreams": [
+										{
+											"destination_name": "db",
+											"local_bind_port": 7000
+										}
+									]
+								}
+							}
+						}
+					}]
+				}`},
+			hcl: []string{`
+				services = [{
+					name = "web"
+					port = 1234
+					connect {
+						sidecar_service {
+							port = 2345
+							checks = [
+								{
+									tcp = "127.0.0.1:2345"
+									interval = "10s"
+								}
+							]
+							proxy {
+								upstreams = [
+									{
+										destination_name = "db"
+										local_bind_port = 7000
+									},
+								]
+							}
+						}
+					}
+				}]
+			`},
+			patch: func(rt *RuntimeConfig) {
+				rt.DataDir = dataDir
+				rt.Services = []*structs.ServiceDefinition{
+					{
+						Name: "web",
+						Port: 1234,
+						Connect: &structs.ServiceConnect{
+							SidecarService: &structs.ServiceDefinition{
+								Port: 2345,
+								Checks: structs.CheckTypes{
+									{
+										TCP:      "127.0.0.1:2345",
+										Interval: 10 * time.Second,
+									},
+								},
+								Proxy: &structs.ConnectProxyConfig{
+									Upstreams: structs.Upstreams{
+										structs.Upstream{
+											DestinationType: "service",
+											DestinationName: "db",
+											LocalBindPort:   7000,
+										},
+									},
+								},
+								Weights: &structs.Weights{
+									Passing: 1,
+									Warning: 1,
+								},
+							},
+						},
+						Weights: &structs.Weights{
+							Passing: 1,
+							Warning: 1,
+						},
+					},
+				}
 			},
 		},
 	}
@@ -1974,7 +2640,7 @@ func testConfig(t *testing.T, tests []configTest, dataDir string) {
 
 			// json and hcl sources need to be in sync
 			// to make sure we're generating the same config
-			if len(tt.json) != len(tt.hcl) {
+			if len(tt.json) != len(tt.hcl) && !tt.skipformat {
 				t.Fatal(tt.desc, ": JSON and HCL test case out of sync")
 			}
 
@@ -1982,6 +2648,12 @@ func testConfig(t *testing.T, tests []configTest, dataDir string) {
 			srcs, tails := tt.json, tt.jsontail
 			if format == "hcl" {
 				srcs, tails = tt.hcl, tt.hcltail
+			}
+
+			// If we're skipping a format and the current format is empty,
+			// then skip it!
+			if tt.skipformat && len(srcs) == 0 {
+				continue
 			}
 
 			// build the description
@@ -2138,15 +2810,32 @@ func TestFullConfig(t *testing.T) {
 			"acl_default_policy": "ArK3WIfE",
 			"acl_down_policy": "vZXMfMP0",
 			"acl_enforce_version_8": true,
-		        "acl_enable_key_list_policy": true,
+			"acl_enable_key_list_policy": true,
 			"acl_master_token": "C1Q1oIwh",
 			"acl_replication_token": "LMmgy5dO",
 			"acl_token": "O1El0wan",
 			"acl_ttl": "18060s",
+			"acl" : {
+				"enabled" : true,
+				"down_policy" : "03eb2aee",
+				"default_policy" : "72c2e7a0",
+				"enable_key_list_policy": false,
+				"policy_ttl": "1123s",
+				"token_ttl": "3321s",
+				"enable_token_replication" : true,
+				"tokens" : {
+					"master" : "8a19ac27",
+					"agent_master" : "64fd0e08",
+					"replication" : "5795983a",
+					"agent" : "bed2377c",
+					"default" : "418fdff1"
+				}
+			},
 			"addresses": {
 				"dns": "93.95.95.81",
 				"http": "83.39.91.39",
-				"https": "95.17.17.19"
+				"https": "95.17.17.19",
+				"grpc": "32.31.61.91"
 			},
 			"advertise_addr": "17.99.29.16",
 			"advertise_addr_wan": "78.63.37.19",
@@ -2172,7 +2861,6 @@ func TestFullConfig(t *testing.T) {
 				"service_id": "L8G0QNmR",
 				"token": "oo4BCTgJ",
 				"status": "qLykAl5u",
-				"script": "dhGfIF8n",
 				"args": ["f3BemRjy", "e5zgpef7"],
 				"http": "29B93haH",
 				"header": {
@@ -2197,7 +2885,6 @@ func TestFullConfig(t *testing.T) {
 					"service_id": "lSulPcyz",
 					"token": "toO59sh8",
 					"status": "9RlWsXMV",
-					"script": "8qbd8tWw",
 					"args": ["4BAJttck", "4D2NPtTQ"],
 					"http": "dohLcyQ2",
 					"header": {
@@ -2221,7 +2908,6 @@ func TestFullConfig(t *testing.T) {
 					"service_id": "CmUUcRna",
 					"token": "a3nQzHuy",
 					"status": "irj26nf3",
-					"script": "FJsI1oXt",
 					"args": ["9s526ogY", "gSlOHj1w"],
 					"http": "yzhgsQ7Y",
 					"header": {
@@ -2241,18 +2927,55 @@ func TestFullConfig(t *testing.T) {
 			],
 			"check_update_interval": "16507s",
 			"client_addr": "93.83.18.19",
+			"connect": {
+				"ca_provider": "consul",
+				"ca_config": {
+					"RotationPeriod": "90h",
+					"LeafCertTTL": "1h"
+				},
+				"enabled": true,
+				"proxy_defaults": {
+					"exec_mode": "script",
+					"daemon_command": ["consul", "connect", "proxy"],
+					"script_command": ["proxyctl.sh"],
+					"config": {
+						"foo": "bar",
+						"connect_timeout_ms": 1000,
+						"pedantic_mode": true
+					}
+				}
+			},
+			"gossip_lan" : {
+				"gossip_nodes": 6,
+				"gossip_interval" : "25252s",
+				"retransmit_mult" : 1234,
+				"suspicion_mult"  : 1235,
+				"probe_interval"  : "101ms",
+				"probe_timeout"   : "102ms"
+			},
+			"gossip_wan" : {
+				"gossip_nodes" : 2,
+				"gossip_interval" : "6966s",
+				"retransmit_mult" : 16384,
+				"suspicion_mult"  : 16385,
+				"probe_interval" : "103ms",
+				"probe_timeout"  : "104ms"
+			},
 			"data_dir": "` + dataDir + `",
 			"datacenter": "rzo029wg",
 			"disable_anonymous_signature": true,
 			"disable_coordinates": true,
 			"disable_host_node_id": true,
+			"disable_http_unprintable_char_filter": true,
 			"disable_keyring_file": true,
 			"disable_remote_exec": true,
 			"disable_update_check": true,
 			"discard_check_output": true,
+			"discovery_max_stale": "5s",
 			"domain": "7W1xXSqd",
 			"dns_config": {
 				"allow_stale": true,
+				"a_record_limit": 29907,
 				"disable_compression": true,
 				"enable_truncate": true,
 				"max_stale": "29685s",
@@ -2268,6 +2991,7 @@ func TestFullConfig(t *testing.T) {
 			"enable_agent_tls_for_checks": true,
 			"enable_debug": true,
 			"enable_script_checks": true,
+			"enable_local_script_checks": true,
 			"enable_syslog": true,
 			"encrypt": "A4wELWqH",
 			"encrypt_verify_incoming": true,
@@ -2303,10 +3027,18 @@ func TestFullConfig(t *testing.T) {
 				"dns": 7001,
 				"http": 7999,
 				"https": 15127,
-				"server": 3757
+				"server": 3757,
+				"grpc": 4881,
+				"proxy_min_port": 2000,
+				"proxy_max_port": 3000,
+				"sidecar_min_port": 8888,
+				"sidecar_max_port": 9999
 			},
 			"protocol": 30793,
+			"primary_datacenter": "ejtmd43d",
 			"raft_protocol": 19016,
+			"raft_snapshot_threshold": 16384,
+			"raft_snapshot_interval": "30s",
 			"reconnect_timeout": "23739s",
 			"reconnect_timeout_wan": "26694s",
 			"recursors": [ "63.38.39.58", "92.49.18.18" ],
@@ -2341,17 +3073,23 @@ func TestFullConfig(t *testing.T) {
 			"service": {
 				"id": "dLOXpSCI",
 				"name": "o1ynPkp0",
+				"meta": {
+					"mymeta": "data"
+				},
 				"tags": ["nkwshvM5", "NTDWn3ek"],
 				"address": "cOlSOhbp",
 				"token": "msy7iWER",
 				"port": 24237,
+				"weights": {
+					"passing": 100,
+					"warning": 1
+				},
 				"enable_tag_override": true,
 				"check": {
-					"check_id": "RMi85Dv8",
+					"id": "RMi85Dv8",
 					"name": "iehanzuq",
 					"status": "rCvn53TH",
 					"notes": "fti5lfF3",
-					"script": "rtj34nfd",
 					"args": ["16WRUmwS", "QWk7j7ae"],
 					"http": "dl3Fgme3",
 					"header": {
@@ -2374,7 +3112,6 @@ func TestFullConfig(t *testing.T) {
 						"name": "sgV4F7Pk",
 						"notes": "yP5nKbW0",
 						"status": "7oLMEyfu",
-						"script": "NlUQ3nTE",
 						"args": ["5wEZtZpv", "0Ihyk8cS"],
 						"http": "KyDjGY9H",
 						"header": {
@@ -2396,7 +3133,6 @@ func TestFullConfig(t *testing.T) {
 						"name": "IEqrzrsd",
 						"notes": "SVqApqeM",
 						"status": "XXkVoZXt",
-						"script": "IXLZTM6E",
 						"args": ["wD05Bvao", "rLYB7kQC"],
 						"http": "kyICZsn8",
 						"header": {
@@ -2413,7 +3149,10 @@ func TestFullConfig(t *testing.T) {
 						"ttl": "1181s",
 						"deregister_critical_service_after": "4992s"
 					}
-				]
+				],
+				"connect": {
+					"native": true
+				}
 			},
 			"services": [
 				{
@@ -2425,11 +3164,10 @@ func TestFullConfig(t *testing.T) {
 					"port": 72219,
 					"enable_tag_override": true,
 					"check": {
-						"check_id": "qmfeO5if",
+						"id": "qmfeO5if",
 						"name": "atDGP7n5",
 						"status": "pDQKEhWL",
 						"notes": "Yt8EDLev",
-						"script": "MDu7wjlD",
 						"args": ["81EDZLPa", "bPY5X8xd"],
 						"http": "qzHYvmJO",
 						"header": {
@@ -2445,6 +3183,9 @@ func TestFullConfig(t *testing.T) {
 						"timeout": "38333s",
 						"ttl": "57201s",
 						"deregister_critical_service_after": "44214s"
+					},
+					"connect": {
+						"sidecar_service": {}
 					}
 				},
 				{
@@ -2454,6 +3195,10 @@ func TestFullConfig(t *testing.T) {
 					"address": "R6H6g8h0",
 					"token": "ZgY8gjMI",
 					"port": 38292,
+					"weights": {
+						"passing": 1979,
+						"warning": 6
+					},
 					"enable_tag_override": true,
 					"checks": [
 						{
@@ -2461,7 +3206,6 @@ func TestFullConfig(t *testing.T) {
 							"name": "9OOS93ne",
 							"notes": "CQy86DH0",
 							"status": "P0SWDvrk",
-							"script": "6BhLJ7R9",
 							"args": ["EXvkYIuG", "BATOyt6h"],
 							"http": "u97ByEiW",
 							"header": {
@@ -2483,7 +3227,6 @@ func TestFullConfig(t *testing.T) {
 							"name": "PQSaPWlT",
 							"notes": "jKChDOdl",
 							"status": "5qFz6OZn",
-							"script": "PbdxFZ3K",
 							"args": ["NMtYWlT9", "vj74JXsm"],
 							"http": "1LBDJhw4",
 							"header": {
@@ -2500,7 +3243,47 @@ func TestFullConfig(t *testing.T) {
 							"ttl": "11222s",
 							"deregister_critical_service_after": "68482s"
 						}
-					]
+					],
+					"connect": {
+						"proxy": {
+							"exec_mode": "daemon",
+							"command": ["awesome-proxy"],
+							"config": {
+								"foo": "qux"
+							}
+						}
+					}
+				},
+				{
+					"id": "Kh81CPF6",
+					"kind": "connect-proxy",
+					"name": "Kh81CPF6-proxy",
+					"port": 31471,
+					"proxy": {
+						"config": {
+								"cedGGtZf": "pWrUNiWw"
+						},
+						"destination_service_id": "6L6BVfgH-id",
+						"destination_service_name": "6L6BVfgH",
+						"local_service_address": "127.0.0.2",
+						"local_service_port": 23759,
+						"upstreams": [
+							{
+								"destination_name": "KPtAj2cb",
+								"local_bind_port": 4051,
+								"config": {
+									"kzRnZOyd": "nUNKoL8H"
+								}
+							},
+							{
+								"destination_name": "KSd8HsRl",
+								"destination_namespace": "9nakw0td",
+								"destination_type": "prepared_query",
+								"local_bind_address": "127.24.88.0",
+								"local_bind_port": 11884
+							}
+						]
+					}
 				}
 			],
 			"session_ttl_min": "26627s",
@@ -2531,12 +3314,12 @@ func TestFullConfig(t *testing.T) {
 				"dogstatsd_tags": [ "3N81zSUB","Xtj8AnXZ" ],
 				"filter_default": true,
 				"prefix_filter": [ "+oJotS8XJ","-cazlEhGn" ],
-				"enable_deprecated_names": true,
 				"metrics_prefix": "ftO6DySn",
+				"prometheus_retention_time": "15s",
 				"statsd_address": "drce87cy",
 				"statsite_address": "HpFwKB8R"
 			},
-			"tls_cipher_suites": "TLS_RSA_WITH_RC4_128_SHA,TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+			"tls_cipher_suites": "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
 			"tls_min_version": "pAOWafkR",
 			"tls_prefer_server_cipher_suites": true,
 			"translate_wan_addrs": true,
@@ -2578,10 +3361,27 @@ func TestFullConfig(t *testing.T) {
 			acl_replication_token = "LMmgy5dO"
 			acl_token = "O1El0wan"
 			acl_ttl = "18060s"
+			acl = {
+				enabled = true
+				down_policy = "03eb2aee"
+				default_policy = "72c2e7a0"
+				enable_key_list_policy = false
+				policy_ttl = "1123s"
+				token_ttl = "3321s"
+				enable_token_replication = true
+				tokens = {
+					master = "8a19ac27",
+					agent_master = "64fd0e08",
+					replication = "5795983a",
+					agent = "bed2377c",
+					default = "418fdff1"
+				}
+			}
 			addresses = {
 				dns = "93.95.95.81"
 				http = "83.39.91.39"
 				https = "95.17.17.19"
+				grpc = "32.31.61.91"
 			}
 			advertise_addr = "17.99.29.16"
 			advertise_addr_wan = "78.63.37.19"
@@ -2607,7 +3407,6 @@ func TestFullConfig(t *testing.T) {
 				service_id = "L8G0QNmR"
 				token = "oo4BCTgJ"
 				status = "qLykAl5u"
-				script = "dhGfIF8n"
 				args = ["f3BemRjy", "e5zgpef7"]
 				http = "29B93haH"
 				header = {
@@ -2632,7 +3431,6 @@ func TestFullConfig(t *testing.T) {
 					service_id = "lSulPcyz"
 					token = "toO59sh8"
 					status = "9RlWsXMV"
-					script = "8qbd8tWw"
 					args = ["4BAJttck", "4D2NPtTQ"]
 					http = "dohLcyQ2"
 					header = {
@@ -2656,7 +3454,6 @@ func TestFullConfig(t *testing.T) {
 					service_id = "CmUUcRna"
 					token = "a3nQzHuy"
 					status = "irj26nf3"
-					script = "FJsI1oXt"
 					args = ["9s526ogY", "gSlOHj1w"]
 					http = "yzhgsQ7Y"
 					header = {
@@ -2676,18 +3473,57 @@ func TestFullConfig(t *testing.T) {
 			]
 			check_update_interval = "16507s"
 			client_addr = "93.83.18.19"
+			connect {
+				ca_provider = "consul"
+				ca_config {
+					rotation_period = "90h"
+					leaf_cert_ttl = "1h"
+				}
+				enabled = true
+				proxy_defaults {
+					exec_mode = "script"
+					daemon_command = ["consul", "connect", "proxy"]
+					script_command = ["proxyctl.sh"]
+					config = {
+						foo = "bar"
+						# hack float since json parses numbers as float and we have to
+						# assert against the same thing
+						connect_timeout_ms = 1000.0
+						pedantic_mode = true
+					}
+				}
+			}
+			gossip_lan {
+				gossip_nodes    = 6
+				gossip_interval = "25252s"
+				retransmit_mult = 1234
+				suspicion_mult  = 1235
+				probe_interval  = "101ms"
+				probe_timeout   = "102ms"
+			}
+			gossip_wan {
+				gossip_nodes    = 2
+				gossip_interval = "6966s"
+				retransmit_mult = 16384
+				suspicion_mult  = 16385
+				probe_interval  = "103ms"
+				probe_timeout   = "104ms"
+			}
 			data_dir = "` + dataDir + `"
 			datacenter = "rzo029wg"
 			disable_anonymous_signature = true
 			disable_coordinates = true
 			disable_host_node_id = true
+			disable_http_unprintable_char_filter = true
 			disable_keyring_file = true
 			disable_remote_exec = true
 			disable_update_check = true
 			discard_check_output = true
+			discovery_max_stale = "5s"
 			domain = "7W1xXSqd"
 			dns_config {
 				allow_stale = true
+				a_record_limit = 29907
 				disable_compression = true
 				enable_truncate = true
 				max_stale = "29685s"
@@ -2703,6 +3539,7 @@ func TestFullConfig(t *testing.T) {
 			enable_agent_tls_for_checks = true
 			enable_debug = true
 			enable_script_checks = true
+			enable_local_script_checks = true
 			enable_syslog = true
 			encrypt = "A4wELWqH"
 			encrypt_verify_incoming = true
@@ -2739,9 +3576,17 @@ func TestFullConfig(t *testing.T) {
 				http = 7999,
 				https = 15127
 				server = 3757
+				grpc = 4881
+				proxy_min_port = 2000
+				proxy_max_port = 3000
+				sidecar_min_port = 8888
+				sidecar_max_port = 9999
 			}
 			protocol = 30793
+			primary_datacenter = "ejtmd43d"
 			raft_protocol = 19016
+			raft_snapshot_threshold = 16384
+			raft_snapshot_interval = "30s"
 			reconnect_timeout = "23739s"
 			reconnect_timeout_wan = "26694s"
 			recursors = [ "63.38.39.58", "92.49.18.18" ]
@@ -2776,17 +3621,23 @@ func TestFullConfig(t *testing.T) {
 			service = {
 				id = "dLOXpSCI"
 				name = "o1ynPkp0"
+				meta = {
+					mymeta = "data"
+				}
 				tags = ["nkwshvM5", "NTDWn3ek"]
 				address = "cOlSOhbp"
 				token = "msy7iWER"
 				port = 24237
+				weights = {
+					passing = 100,
+					warning = 1
+				}
 				enable_tag_override = true
 				check = {
-					check_id = "RMi85Dv8"
+					id = "RMi85Dv8"
 					name = "iehanzuq"
 					status = "rCvn53TH"
 					notes = "fti5lfF3"
-					script = "rtj34nfd"
 					args = ["16WRUmwS", "QWk7j7ae"]
 					http = "dl3Fgme3"
 					header = {
@@ -2809,7 +3660,6 @@ func TestFullConfig(t *testing.T) {
 						name = "sgV4F7Pk"
 						notes = "yP5nKbW0"
 						status = "7oLMEyfu"
-						script = "NlUQ3nTE"
 						args = ["5wEZtZpv", "0Ihyk8cS"]
 						http = "KyDjGY9H"
 						header = {
@@ -2831,7 +3681,6 @@ func TestFullConfig(t *testing.T) {
 						name = "IEqrzrsd"
 						notes = "SVqApqeM"
 						status = "XXkVoZXt"
-						script = "IXLZTM6E"
 						args = ["wD05Bvao", "rLYB7kQC"]
 						http = "kyICZsn8"
 						header = {
@@ -2849,6 +3698,9 @@ func TestFullConfig(t *testing.T) {
 						deregister_critical_service_after = "4992s"
 					}
 				]
+				connect {
+					native = true
+				}
 			}
 			services = [
 				{
@@ -2860,11 +3712,10 @@ func TestFullConfig(t *testing.T) {
 					port = 72219
 					enable_tag_override = true
 					check = {
-						check_id = "qmfeO5if"
+						id = "qmfeO5if"
 						name = "atDGP7n5"
 						status = "pDQKEhWL"
 						notes = "Yt8EDLev"
-						script = "MDu7wjlD"
 						args = ["81EDZLPa", "bPY5X8xd"]
 						http = "qzHYvmJO"
 						header = {
@@ -2881,6 +3732,9 @@ func TestFullConfig(t *testing.T) {
 						ttl = "57201s"
 						deregister_critical_service_after = "44214s"
 					}
+					connect {
+						sidecar_service {}
+					}
 				},
 				{
 					id = "MRHVMZuD"
@@ -2889,6 +3743,10 @@ func TestFullConfig(t *testing.T) {
 					address = "R6H6g8h0"
 					token = "ZgY8gjMI"
 					port = 38292
+					weights = {
+						passing = 1979,
+						warning = 6
+					}
 					enable_tag_override = true
 					checks = [
 						{
@@ -2896,7 +3754,6 @@ func TestFullConfig(t *testing.T) {
 							name = "9OOS93ne"
 							notes = "CQy86DH0"
 							status = "P0SWDvrk"
-							script = "6BhLJ7R9"
 							args = ["EXvkYIuG", "BATOyt6h"]
 							http = "u97ByEiW"
 							header = {
@@ -2918,7 +3775,6 @@ func TestFullConfig(t *testing.T) {
 							name = "PQSaPWlT"
 							notes = "jKChDOdl"
 							status = "5qFz6OZn"
-							script = "PbdxFZ3K"
 							args = ["NMtYWlT9", "vj74JXsm"]
 							http = "1LBDJhw4"
 							header = {
@@ -2936,6 +3792,46 @@ func TestFullConfig(t *testing.T) {
 							deregister_critical_service_after = "68482s"
 						}
 					]
+					connect {
+						proxy {
+							exec_mode = "daemon"
+							command = ["awesome-proxy"]
+							config = {
+								foo = "qux"
+							}
+						}
+					}
+				},
+				{
+					id = "Kh81CPF6"
+					name = "Kh81CPF6-proxy"
+					port = 31471
+					kind = "connect-proxy"
+					proxy {
+						destination_service_name = "6L6BVfgH"
+						destination_service_id = "6L6BVfgH-id"
+						local_service_address = "127.0.0.2"
+						local_service_port = 23759
+						config {
+							cedGGtZf = "pWrUNiWw"
+						}
+						upstreams = [
+							{
+								destination_name = "KPtAj2cb"
+								local_bind_port = 4051
+								config {
+									kzRnZOyd = "nUNKoL8H"
+								}
+							},
+							{
+								destination_type = "prepared_query"
+								destination_namespace = "9nakw0td"
+								destination_name = "KSd8HsRl"
+								local_bind_port = 11884
+								local_bind_address = "127.24.88.0"
+							},
+						]
+					}
 				}
 			]
 			session_ttl_min = "26627s"
@@ -2966,12 +3862,12 @@ func TestFullConfig(t *testing.T) {
 				dogstatsd_tags = [ "3N81zSUB","Xtj8AnXZ" ]
 				filter_default = true
 				prefix_filter = [ "+oJotS8XJ","-cazlEhGn" ]
-				enable_deprecated_names = true
 				metrics_prefix = "ftO6DySn"
+				prometheus_retention_time = "15s"
 				statsd_address = "drce87cy"
 				statsite_address = "HpFwKB8R"
 			}
-			tls_cipher_suites = "TLS_RSA_WITH_RC4_128_SHA,TLS_RSA_WITH_3DES_EDE_CBC_SHA"
+			tls_cipher_suites = "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
 			tls_min_version = "pAOWafkR"
 			tls_prefer_server_cipher_suites = true
 			translate_wan_addrs = true
@@ -3008,9 +3904,13 @@ func TestFullConfig(t *testing.T) {
 				Data: `
 				{
 					"acl_disabled_ttl": "957s",
+					"acl" : {
+						"disabled_ttl" : "957s"
+					},
 					"ae_interval": "10003s",
 					"check_deregister_interval_min": "27870s",
 					"check_reap_interval": "10662s",
+					"discovery_max_stale": "5s",
 					"segment_limit": 24705,
 					"segment_name_limit": 27046,
 					"sync_coordinate_interval_min": "27983s",
@@ -3033,22 +3933,6 @@ func TestFullConfig(t *testing.T) {
 							"heartbeat_timeout": "25699s",
 							"leader_lease_timeout": "15351s"
 						},
-						"serf_lan": {
-							"memberlist": {
-								"gossip_interval": "25252s",
-								"probe_interval": "5105s",
-								"probe_timeout": "29179s",
-								"suspicion_mult": 8263
-							}
-						},
-						"serf_wan": {
-							"memberlist": {
-								"gossip_interval": "6966s",
-								"probe_interval": "20148s",
-								"probe_timeout": "3007s",
-								"suspicion_mult": 32096
-							}
-						},
 						"server": {
 							"health_interval": "17455s"
 						}
@@ -3062,9 +3946,13 @@ func TestFullConfig(t *testing.T) {
 				Format: "hcl",
 				Data: `
 					acl_disabled_ttl = "957s"
+					acl = {
+						disabled_ttl = "957s"
+					}
 					ae_interval = "10003s"
 					check_deregister_interval_min = "27870s"
 					check_reap_interval = "10662s"
+					discovery_max_stale = "5s"
 					segment_limit = 24705
 					segment_name_limit = 27046
 					sync_coordinate_interval_min = "27983s"
@@ -3085,22 +3973,6 @@ func TestFullConfig(t *testing.T) {
 							election_timeout = "31947s"
 							heartbeat_timeout = "25699s"
 							leader_lease_timeout = "15351s"
-						}
-						serf_lan = {
-							memberlist = {
-								gossip_interval = "25252s"
-								probe_interval = "5105s"
-								probe_timeout = "29179s"
-								suspicion_mult = 8263
-							}
-						}
-						serf_wan = {
-							memberlist = {
-								gossip_interval = "6966s"
-								probe_interval = "20148s"
-								probe_timeout = "3007s"
-								suspicion_mult = 32096
-							}
 						}
 						server = {
 							health_interval = "17455s"
@@ -3133,29 +4005,36 @@ func TestFullConfig(t *testing.T) {
 		ConsulRaftElectionTimeout:        5 * 31947 * time.Second,
 		ConsulRaftHeartbeatTimeout:       5 * 25699 * time.Second,
 		ConsulRaftLeaderLeaseTimeout:     5 * 15351 * time.Second,
-		ConsulSerfLANGossipInterval:      25252 * time.Second,
-		ConsulSerfLANProbeInterval:       5105 * time.Second,
-		ConsulSerfLANProbeTimeout:        29179 * time.Second,
-		ConsulSerfLANSuspicionMult:       8263,
-		ConsulSerfWANGossipInterval:      6966 * time.Second,
-		ConsulSerfWANProbeInterval:       20148 * time.Second,
-		ConsulSerfWANProbeTimeout:        3007 * time.Second,
-		ConsulSerfWANSuspicionMult:       32096,
+		GossipLANGossipInterval:          25252 * time.Second,
+		GossipLANGossipNodes:             6,
+		GossipLANProbeInterval:           101 * time.Millisecond,
+		GossipLANProbeTimeout:            102 * time.Millisecond,
+		GossipLANSuspicionMult:           1235,
+		GossipLANRetransmitMult:          1234,
+		GossipWANGossipInterval:          6966 * time.Second,
+		GossipWANGossipNodes:             2,
+		GossipWANProbeInterval:           103 * time.Millisecond,
+		GossipWANProbeTimeout:            104 * time.Millisecond,
+		GossipWANSuspicionMult:           16385,
+		GossipWANRetransmitMult:          16384,
 		ConsulServerHealthInterval:       17455 * time.Second,
 
 		// user configurable values
 
-		ACLAgentMasterToken:              "furuQD0b",
-		ACLAgentToken:                    "cOshLOQ2",
-		ACLDatacenter:                    "m3urck3z",
-		ACLDefaultPolicy:                 "ArK3WIfE",
-		ACLDownPolicy:                    "vZXMfMP0",
+		ACLAgentMasterToken:              "64fd0e08",
+		ACLAgentToken:                    "bed2377c",
+		ACLsEnabled:                      true,
+		ACLDatacenter:                    "ejtmd43d",
+		ACLDefaultPolicy:                 "72c2e7a0",
+		ACLDownPolicy:                    "03eb2aee",
 		ACLEnforceVersion8:               true,
-		ACLEnableKeyListPolicy:           true,
-		ACLMasterToken:                   "C1Q1oIwh",
-		ACLReplicationToken:              "LMmgy5dO",
-		ACLTTL:                           18060 * time.Second,
-		ACLToken:                         "O1El0wan",
+		ACLEnableKeyListPolicy:           false,
+		ACLMasterToken:                   "8a19ac27",
+		ACLReplicationToken:              "5795983a",
+		ACLTokenTTL:                      3321 * time.Second,
+		ACLPolicyTTL:                     1123 * time.Second,
+		ACLToken:                         "418fdff1",
+		ACLTokenReplication:              true,
 		AdvertiseAddrLAN:                 ipAddr("17.99.29.16"),
 		AdvertiseAddrWAN:                 ipAddr("78.63.37.19"),
 		AutopilotCleanupDeadServers:      true,
@@ -3179,21 +4058,20 @@ func TestFullConfig(t *testing.T) {
 				ServiceID:  "lSulPcyz",
 				Token:      "toO59sh8",
 				Status:     "9RlWsXMV",
-				Script:     "8qbd8tWw",
 				ScriptArgs: []string{"4BAJttck", "4D2NPtTQ"},
 				HTTP:       "dohLcyQ2",
 				Header: map[string][]string{
 					"ZBfTin3L": []string{"1sDbEqYG", "lJGASsWK"},
 					"Ui0nU99X": []string{"LMccm3Qe", "k5H5RggQ"},
 				},
-				Method:            "aldrIQ4l",
-				TCP:               "RJQND605",
-				Interval:          22164 * time.Second,
-				DockerContainerID: "ipgdFtjd",
-				Shell:             "qAeOYy0M",
-				TLSSkipVerify:     true,
-				Timeout:           1813 * time.Second,
-				TTL:               21743 * time.Second,
+				Method:                         "aldrIQ4l",
+				TCP:                            "RJQND605",
+				Interval:                       22164 * time.Second,
+				DockerContainerID:              "ipgdFtjd",
+				Shell:                          "qAeOYy0M",
+				TLSSkipVerify:                  true,
+				Timeout:                        1813 * time.Second,
+				TTL:                            21743 * time.Second,
 				DeregisterCriticalServiceAfter: 14232 * time.Second,
 			},
 			&structs.CheckDefinition{
@@ -3203,21 +4081,20 @@ func TestFullConfig(t *testing.T) {
 				ServiceID:  "CmUUcRna",
 				Token:      "a3nQzHuy",
 				Status:     "irj26nf3",
-				Script:     "FJsI1oXt",
 				ScriptArgs: []string{"9s526ogY", "gSlOHj1w"},
 				HTTP:       "yzhgsQ7Y",
 				Header: map[string][]string{
 					"zcqwA8dO": []string{"qb1zx0DL", "sXCxPFsD"},
 					"qxvdnSE9": []string{"6wBPUYdF", "YYh8wtSZ"},
 				},
-				Method:            "gLrztrNw",
-				TCP:               "4jG5casb",
-				Interval:          28767 * time.Second,
-				DockerContainerID: "THW6u7rL",
-				Shell:             "C1Zt3Zwh",
-				TLSSkipVerify:     true,
-				Timeout:           18506 * time.Second,
-				TTL:               31006 * time.Second,
+				Method:                         "gLrztrNw",
+				TCP:                            "4jG5casb",
+				Interval:                       28767 * time.Second,
+				DockerContainerID:              "THW6u7rL",
+				Shell:                          "C1Zt3Zwh",
+				TLSSkipVerify:                  true,
+				Timeout:                        18506 * time.Second,
+				TTL:                            31006 * time.Second,
 				DeregisterCriticalServiceAfter: 2366 * time.Second,
 			},
 			&structs.CheckDefinition{
@@ -3227,90 +4104,119 @@ func TestFullConfig(t *testing.T) {
 				ServiceID:  "L8G0QNmR",
 				Token:      "oo4BCTgJ",
 				Status:     "qLykAl5u",
-				Script:     "dhGfIF8n",
 				ScriptArgs: []string{"f3BemRjy", "e5zgpef7"},
 				HTTP:       "29B93haH",
 				Header: map[string][]string{
 					"hBq0zn1q": {"2a9o9ZKP", "vKwA5lR6"},
 					"f3r6xFtM": {"RyuIdDWv", "QbxEcIUM"},
 				},
-				Method:            "Dou0nGT5",
-				TCP:               "JY6fTTcw",
-				Interval:          18714 * time.Second,
-				DockerContainerID: "qF66POS9",
-				Shell:             "sOnDy228",
-				TLSSkipVerify:     true,
-				Timeout:           5954 * time.Second,
-				TTL:               30044 * time.Second,
+				Method:                         "Dou0nGT5",
+				TCP:                            "JY6fTTcw",
+				Interval:                       18714 * time.Second,
+				DockerContainerID:              "qF66POS9",
+				Shell:                          "sOnDy228",
+				TLSSkipVerify:                  true,
+				Timeout:                        5954 * time.Second,
+				TTL:                            30044 * time.Second,
 				DeregisterCriticalServiceAfter: 13209 * time.Second,
 			},
 		},
-		CheckUpdateInterval:       16507 * time.Second,
-		ClientAddrs:               []*net.IPAddr{ipAddr("93.83.18.19")},
-		DNSAddrs:                  []net.Addr{tcpAddr("93.95.95.81:7001"), udpAddr("93.95.95.81:7001")},
-		DNSAllowStale:             true,
-		DNSDisableCompression:     true,
-		DNSDomain:                 "7W1xXSqd",
-		DNSEnableTruncate:         true,
-		DNSMaxStale:               29685 * time.Second,
-		DNSNodeTTL:                7084 * time.Second,
-		DNSOnlyPassing:            true,
-		DNSPort:                   7001,
-		DNSRecursorTimeout:        4427 * time.Second,
-		DNSRecursors:              []string{"63.38.39.58", "92.49.18.18"},
-		DNSServiceTTL:             map[string]time.Duration{"*": 32030 * time.Second},
-		DNSUDPAnswerLimit:         29909,
-		DataDir:                   dataDir,
-		Datacenter:                "rzo029wg",
-		DevMode:                   true,
-		DisableAnonymousSignature: true,
-		DisableCoordinates:        true,
-		DisableHostNodeID:         true,
-		DisableKeyringFile:        true,
-		DisableRemoteExec:         true,
-		DisableUpdateCheck:        true,
-		DiscardCheckOutput:        true,
-		EnableACLReplication:      true,
-		EnableAgentTLSForChecks:   true,
-		EnableDebug:               true,
-		EnableScriptChecks:        true,
-		EnableSyslog:              true,
-		EnableUI:                  true,
-		EncryptKey:                "A4wELWqH",
-		EncryptVerifyIncoming:     true,
-		EncryptVerifyOutgoing:     true,
-		HTTPAddrs:                 []net.Addr{tcpAddr("83.39.91.39:7999")},
-		HTTPBlockEndpoints:        []string{"RBvAFcGD", "fWOWFznh"},
-		HTTPPort:                  7999,
-		HTTPResponseHeaders:       map[string]string{"M6TKa9NP": "xjuxjOzQ", "JRCrHZed": "rl0mTx81"},
-		HTTPSAddrs:                []net.Addr{tcpAddr("95.17.17.19:15127")},
-		HTTPSPort:                 15127,
-		KeyFile:                   "IEkkwgIA",
-		LeaveDrainTime:            8265 * time.Second,
-		LeaveOnTerm:               true,
-		LogLevel:                  "k1zo9Spt",
-		NodeID:                    types.NodeID("AsUIlw99"),
-		NodeMeta:                  map[string]string{"5mgGQMBk": "mJLtVMSG", "A7ynFMJB": "0Nx6RGab"},
-		NodeName:                  "otlLxGaI",
-		NonVotingServer:           true,
-		PidFile:                   "43xN80Km",
-		RPCAdvertiseAddr:          tcpAddr("17.99.29.16:3757"),
-		RPCBindAddr:               tcpAddr("16.99.34.17:3757"),
-		RPCHoldTimeout:            15707 * time.Second,
-		RPCProtocol:               30793,
-		RPCRateLimit:              12029.43,
-		RPCMaxBurst:               44848,
-		RaftProtocol:              19016,
-		ReconnectTimeoutLAN:       23739 * time.Second,
-		ReconnectTimeoutWAN:       26694 * time.Second,
-		RejoinAfterLeave:          true,
-		RetryJoinIntervalLAN:      8067 * time.Second,
-		RetryJoinIntervalWAN:      28866 * time.Second,
-		RetryJoinLAN:              []string{"pbsSFY7U", "l0qLtWij"},
-		RetryJoinMaxAttemptsLAN:   913,
-		RetryJoinMaxAttemptsWAN:   23160,
-		RetryJoinWAN:              []string{"PFsR02Ye", "rJdQIhER"},
-		SegmentName:               "BC2NhTDi",
+		CheckUpdateInterval:     16507 * time.Second,
+		ClientAddrs:             []*net.IPAddr{ipAddr("93.83.18.19")},
+		ConnectEnabled:          true,
+		ConnectProxyBindMinPort: 2000,
+		ConnectProxyBindMaxPort: 3000,
+		ConnectSidecarMinPort:   8888,
+		ConnectSidecarMaxPort:   9999,
+		ConnectCAProvider:       "consul",
+		ConnectCAConfig: map[string]interface{}{
+			"RotationPeriod": "90h",
+			"LeafCertTTL":    "1h",
+		},
+		ConnectProxyAllowManagedRoot:            false,
+		ConnectProxyAllowManagedAPIRegistration: false,
+		ConnectProxyDefaultExecMode:             "script",
+		ConnectProxyDefaultDaemonCommand:        []string{"consul", "connect", "proxy"},
+		ConnectProxyDefaultScriptCommand:        []string{"proxyctl.sh"},
+		ConnectProxyDefaultConfig: map[string]interface{}{
+			"foo":                "bar",
+			"connect_timeout_ms": float64(1000),
+			"pedantic_mode":      true,
+		},
+		DNSAddrs:                         []net.Addr{tcpAddr("93.95.95.81:7001"), udpAddr("93.95.95.81:7001")},
+		DNSARecordLimit:                  29907,
+		DNSAllowStale:                    true,
+		DNSDisableCompression:            true,
+		DNSDomain:                        "7W1xXSqd",
+		DNSEnableTruncate:                true,
+		DNSMaxStale:                      29685 * time.Second,
+		DNSNodeTTL:                       7084 * time.Second,
+		DNSOnlyPassing:                   true,
+		DNSPort:                          7001,
+		DNSRecursorTimeout:               4427 * time.Second,
+		DNSRecursors:                     []string{"63.38.39.58", "92.49.18.18"},
+		DNSSOA:                           RuntimeSOAConfig{Refresh: 3600, Retry: 600, Expire: 86400, Minttl: 0},
+		DNSServiceTTL:                    map[string]time.Duration{"*": 32030 * time.Second},
+		DNSUDPAnswerLimit:                29909,
+		DNSNodeMetaTXT:                   true,
+		DataDir:                          dataDir,
+		Datacenter:                       "rzo029wg",
+		DevMode:                          true,
+		DisableAnonymousSignature:        true,
+		DisableCoordinates:               true,
+		DisableHostNodeID:                true,
+		DisableHTTPUnprintableCharFilter: true,
+		DisableKeyringFile:               true,
+		DisableRemoteExec:                true,
+		DisableUpdateCheck:               true,
+		DiscardCheckOutput:               true,
+		DiscoveryMaxStale:                5 * time.Second,
+		EnableAgentTLSForChecks:          true,
+		EnableDebug:                      true,
+		EnableRemoteScriptChecks:         true,
+		EnableLocalScriptChecks:          true,
+		EnableSyslog:                     true,
+		EnableUI:                         true,
+		EncryptKey:                       "A4wELWqH",
+		EncryptVerifyIncoming:            true,
+		EncryptVerifyOutgoing:            true,
+		GRPCPort:                         4881,
+		GRPCAddrs:                        []net.Addr{tcpAddr("32.31.61.91:4881")},
+		HTTPAddrs:                        []net.Addr{tcpAddr("83.39.91.39:7999")},
+		HTTPBlockEndpoints:               []string{"RBvAFcGD", "fWOWFznh"},
+		HTTPPort:                         7999,
+		HTTPResponseHeaders:              map[string]string{"M6TKa9NP": "xjuxjOzQ", "JRCrHZed": "rl0mTx81"},
+		HTTPSAddrs:                       []net.Addr{tcpAddr("95.17.17.19:15127")},
+		HTTPSPort:                        15127,
+		KeyFile:                          "IEkkwgIA",
+		LeaveDrainTime:                   8265 * time.Second,
+		LeaveOnTerm:                      true,
+		LogLevel:                         "k1zo9Spt",
+		NodeID:                           types.NodeID("AsUIlw99"),
+		NodeMeta:                         map[string]string{"5mgGQMBk": "mJLtVMSG", "A7ynFMJB": "0Nx6RGab"},
+		NodeName:                         "otlLxGaI",
+		NonVotingServer:                  true,
+		PidFile:                          "43xN80Km",
+		PrimaryDatacenter:                "ejtmd43d",
+		RPCAdvertiseAddr:                 tcpAddr("17.99.29.16:3757"),
+		RPCBindAddr:                      tcpAddr("16.99.34.17:3757"),
+		RPCHoldTimeout:                   15707 * time.Second,
+		RPCProtocol:                      30793,
+		RPCRateLimit:                     12029.43,
+		RPCMaxBurst:                      44848,
+		RaftProtocol:                     19016,
+		RaftSnapshotThreshold:            16384,
+		RaftSnapshotInterval:             30 * time.Second,
+		ReconnectTimeoutLAN:              23739 * time.Second,
+		ReconnectTimeoutWAN:              26694 * time.Second,
+		RejoinAfterLeave:                 true,
+		RetryJoinIntervalLAN:             8067 * time.Second,
+		RetryJoinIntervalWAN:             28866 * time.Second,
+		RetryJoinLAN:                     []string{"pbsSFY7U", "l0qLtWij"},
+		RetryJoinMaxAttemptsLAN:          913,
+		RetryJoinMaxAttemptsWAN:          23160,
+		RetryJoinWAN:                     []string{"PFsR02Ye", "rJdQIhER"},
+		SegmentName:                      "BC2NhTDi",
 		Segments: []structs.NetworkSegment{
 			{
 				Name:        "PExYMe2E",
@@ -3332,12 +4238,16 @@ func TestFullConfig(t *testing.T) {
 		ServerPort:  3757,
 		Services: []*structs.ServiceDefinition{
 			{
-				ID:                "wI1dzxS4",
-				Name:              "7IszXMQ1",
-				Tags:              []string{"0Zwg8l6v", "zebELdN5"},
-				Address:           "9RhqPSPB",
-				Token:             "myjKJkWH",
-				Port:              72219,
+				ID:      "wI1dzxS4",
+				Name:    "7IszXMQ1",
+				Tags:    []string{"0Zwg8l6v", "zebELdN5"},
+				Address: "9RhqPSPB",
+				Token:   "myjKJkWH",
+				Port:    72219,
+				Weights: &structs.Weights{
+					Passing: 1,
+					Warning: 1,
+				},
 				EnableTagOverride: true,
 				Checks: []*structs.CheckType{
 					&structs.CheckType{
@@ -3345,32 +4255,47 @@ func TestFullConfig(t *testing.T) {
 						Name:       "atDGP7n5",
 						Status:     "pDQKEhWL",
 						Notes:      "Yt8EDLev",
-						Script:     "MDu7wjlD",
 						ScriptArgs: []string{"81EDZLPa", "bPY5X8xd"},
 						HTTP:       "qzHYvmJO",
 						Header: map[string][]string{
 							"UkpmZ3a3": {"2dfzXuxZ"},
 							"cVFpko4u": {"gGqdEB6k", "9LsRo22u"},
 						},
-						Method:            "X5DrovFc",
-						TCP:               "ICbxkpSF",
-						Interval:          24392 * time.Second,
-						DockerContainerID: "ZKXr68Yb",
-						Shell:             "CEfzx0Fo",
-						TLSSkipVerify:     true,
-						Timeout:           38333 * time.Second,
-						TTL:               57201 * time.Second,
+						Method:                         "X5DrovFc",
+						TCP:                            "ICbxkpSF",
+						Interval:                       24392 * time.Second,
+						DockerContainerID:              "ZKXr68Yb",
+						Shell:                          "CEfzx0Fo",
+						TLSSkipVerify:                  true,
+						Timeout:                        38333 * time.Second,
+						TTL:                            57201 * time.Second,
 						DeregisterCriticalServiceAfter: 44214 * time.Second,
+					},
+				},
+				// Note that although this SidecarService is only syntax sugar for
+				// registering another service, that has to happen in the agent code so
+				// it can make intelligent decisions about automatic port assignments
+				// etc. So we expect config just to pass it through verbatim.
+				Connect: &structs.ServiceConnect{
+					SidecarService: &structs.ServiceDefinition{
+						Weights: &structs.Weights{
+							Passing: 1,
+							Warning: 1,
+						},
 					},
 				},
 			},
 			{
-				ID:                "MRHVMZuD",
-				Name:              "6L6BVfgH",
-				Tags:              []string{"7Ale4y6o", "PMBW08hy"},
-				Address:           "R6H6g8h0",
-				Token:             "ZgY8gjMI",
-				Port:              38292,
+				ID:      "MRHVMZuD",
+				Name:    "6L6BVfgH",
+				Tags:    []string{"7Ale4y6o", "PMBW08hy"},
+				Address: "R6H6g8h0",
+				Token:   "ZgY8gjMI",
+				Port:    38292,
+				Weights: &structs.Weights{
+					Passing: 1979,
+					Warning: 6,
+				},
 				EnableTagOverride: true,
 				Checks: structs.CheckTypes{
 					&structs.CheckType{
@@ -3378,21 +4303,20 @@ func TestFullConfig(t *testing.T) {
 						Name:       "9OOS93ne",
 						Notes:      "CQy86DH0",
 						Status:     "P0SWDvrk",
-						Script:     "6BhLJ7R9",
 						ScriptArgs: []string{"EXvkYIuG", "BATOyt6h"},
 						HTTP:       "u97ByEiW",
 						Header: map[string][]string{
 							"MUlReo8L": {"AUZG7wHG", "gsN0Dc2N"},
 							"1UJXjVrT": {"OJgxzTfk", "xZZrFsq7"},
 						},
-						Method:            "5wkAxCUE",
-						TCP:               "MN3oA9D2",
-						Interval:          32718 * time.Second,
-						DockerContainerID: "cU15LMet",
-						Shell:             "nEz9qz2l",
-						TLSSkipVerify:     true,
-						Timeout:           34738 * time.Second,
-						TTL:               22773 * time.Second,
+						Method:                         "5wkAxCUE",
+						TCP:                            "MN3oA9D2",
+						Interval:                       32718 * time.Second,
+						DockerContainerID:              "cU15LMet",
+						Shell:                          "nEz9qz2l",
+						TLSSkipVerify:                  true,
+						Timeout:                        34738 * time.Second,
+						TTL:                            22773 * time.Second,
 						DeregisterCriticalServiceAfter: 84282 * time.Second,
 					},
 					&structs.CheckType{
@@ -3400,54 +4324,105 @@ func TestFullConfig(t *testing.T) {
 						Name:       "PQSaPWlT",
 						Notes:      "jKChDOdl",
 						Status:     "5qFz6OZn",
-						Script:     "PbdxFZ3K",
 						ScriptArgs: []string{"NMtYWlT9", "vj74JXsm"},
 						HTTP:       "1LBDJhw4",
 						Header: map[string][]string{
 							"cXPmnv1M": {"imDqfaBx", "NFxZ1bQe"},
 							"vr7wY7CS": {"EtCoNPPL", "9vAarJ5s"},
 						},
-						Method:            "wzByP903",
-						TCP:               "2exjZIGE",
-						Interval:          5656 * time.Second,
-						DockerContainerID: "5tDBWpfA",
-						Shell:             "rlTpLM8s",
-						TLSSkipVerify:     true,
-						Timeout:           4868 * time.Second,
-						TTL:               11222 * time.Second,
+						Method:                         "wzByP903",
+						TCP:                            "2exjZIGE",
+						Interval:                       5656 * time.Second,
+						DockerContainerID:              "5tDBWpfA",
+						Shell:                          "rlTpLM8s",
+						TLSSkipVerify:                  true,
+						Timeout:                        4868 * time.Second,
+						TTL:                            11222 * time.Second,
 						DeregisterCriticalServiceAfter: 68482 * time.Second,
+					},
+				},
+				Connect: &structs.ServiceConnect{
+					Proxy: &structs.ServiceDefinitionConnectProxy{
+						ExecMode: "daemon",
+						Command:  []string{"awesome-proxy"},
+						Config: map[string]interface{}{
+							"foo": "qux",
+						},
 					},
 				},
 			},
 			{
-				ID:                "dLOXpSCI",
-				Name:              "o1ynPkp0",
-				Tags:              []string{"nkwshvM5", "NTDWn3ek"},
-				Address:           "cOlSOhbp",
-				Token:             "msy7iWER",
-				Port:              24237,
+				ID:   "Kh81CPF6",
+				Name: "Kh81CPF6-proxy",
+				Port: 31471,
+				Kind: "connect-proxy",
+				Proxy: &structs.ConnectProxyConfig{
+					DestinationServiceName: "6L6BVfgH",
+					DestinationServiceID:   "6L6BVfgH-id",
+					LocalServiceAddress:    "127.0.0.2",
+					LocalServicePort:       23759,
+					Config: map[string]interface{}{
+						"cedGGtZf": "pWrUNiWw",
+					},
+					Upstreams: structs.Upstreams{
+						{
+							DestinationType: "service", // Default should be explicitly filled
+							DestinationName: "KPtAj2cb",
+							LocalBindPort:   4051,
+							Config: map[string]interface{}{
+								"kzRnZOyd": "nUNKoL8H",
+							},
+						},
+						{
+							DestinationType:      "prepared_query",
+							DestinationNamespace: "9nakw0td",
+							DestinationName:      "KSd8HsRl",
+							LocalBindPort:        11884,
+							LocalBindAddress:     "127.24.88.0",
+						},
+					},
+				},
+				Weights: &structs.Weights{
+					Passing: 1,
+					Warning: 1,
+				},
+			},
+			{
+				ID:      "dLOXpSCI",
+				Name:    "o1ynPkp0",
+				Tags:    []string{"nkwshvM5", "NTDWn3ek"},
+				Address: "cOlSOhbp",
+				Token:   "msy7iWER",
+				Meta:    map[string]string{"mymeta": "data"},
+				Port:    24237,
+				Weights: &structs.Weights{
+					Passing: 100,
+					Warning: 1,
+				},
 				EnableTagOverride: true,
+				Connect: &structs.ServiceConnect{
+					Native: true,
+				},
 				Checks: structs.CheckTypes{
 					&structs.CheckType{
 						CheckID:    "Zv99e9Ka",
 						Name:       "sgV4F7Pk",
 						Notes:      "yP5nKbW0",
 						Status:     "7oLMEyfu",
-						Script:     "NlUQ3nTE",
 						ScriptArgs: []string{"5wEZtZpv", "0Ihyk8cS"},
 						HTTP:       "KyDjGY9H",
 						Header: map[string][]string{
 							"gv5qefTz": {"5Olo2pMG", "PvvKWQU5"},
 							"SHOVq1Vv": {"jntFhyym", "GYJh32pp"},
 						},
-						Method:            "T66MFBfR",
-						TCP:               "bNnNfx2A",
-						Interval:          22224 * time.Second,
-						DockerContainerID: "ipgdFtjd",
-						Shell:             "omVZq7Sz",
-						TLSSkipVerify:     true,
-						Timeout:           18913 * time.Second,
-						TTL:               44743 * time.Second,
+						Method:                         "T66MFBfR",
+						TCP:                            "bNnNfx2A",
+						Interval:                       22224 * time.Second,
+						DockerContainerID:              "ipgdFtjd",
+						Shell:                          "omVZq7Sz",
+						TLSSkipVerify:                  true,
+						Timeout:                        18913 * time.Second,
+						TTL:                            44743 * time.Second,
 						DeregisterCriticalServiceAfter: 8482 * time.Second,
 					},
 					&structs.CheckType{
@@ -3455,21 +4430,20 @@ func TestFullConfig(t *testing.T) {
 						Name:       "IEqrzrsd",
 						Notes:      "SVqApqeM",
 						Status:     "XXkVoZXt",
-						Script:     "IXLZTM6E",
 						ScriptArgs: []string{"wD05Bvao", "rLYB7kQC"},
 						HTTP:       "kyICZsn8",
 						Header: map[string][]string{
 							"4ebP5vL4": {"G20SrL5Q", "DwPKlMbo"},
 							"p2UI34Qz": {"UsG1D0Qh", "NHhRiB6s"},
 						},
-						Method:            "ciYHWors",
-						TCP:               "FfvCwlqH",
-						Interval:          12356 * time.Second,
-						DockerContainerID: "HBndBU6R",
-						Shell:             "hVI33JjA",
-						TLSSkipVerify:     true,
-						Timeout:           38282 * time.Second,
-						TTL:               1181 * time.Second,
+						Method:                         "ciYHWors",
+						TCP:                            "FfvCwlqH",
+						Interval:                       12356 * time.Second,
+						DockerContainerID:              "HBndBU6R",
+						Shell:                          "hVI33JjA",
+						TLSSkipVerify:                  true,
+						Timeout:                        38282 * time.Second,
+						TTL:                            1181 * time.Second,
 						DeregisterCriticalServiceAfter: 4992 * time.Second,
 					},
 					&structs.CheckType{
@@ -3477,60 +4451,62 @@ func TestFullConfig(t *testing.T) {
 						Name:       "iehanzuq",
 						Status:     "rCvn53TH",
 						Notes:      "fti5lfF3",
-						Script:     "rtj34nfd",
 						ScriptArgs: []string{"16WRUmwS", "QWk7j7ae"},
 						HTTP:       "dl3Fgme3",
 						Header: map[string][]string{
 							"rjm4DEd3": {"2m3m2Fls"},
 							"l4HwQ112": {"fk56MNlo", "dhLK56aZ"},
 						},
-						Method:            "9afLm3Mj",
-						TCP:               "fjiLFqVd",
-						Interval:          23926 * time.Second,
-						DockerContainerID: "dO5TtRHk",
-						Shell:             "e6q2ttES",
-						TLSSkipVerify:     true,
-						Timeout:           38483 * time.Second,
-						TTL:               10943 * time.Second,
+						Method:                         "9afLm3Mj",
+						TCP:                            "fjiLFqVd",
+						Interval:                       23926 * time.Second,
+						DockerContainerID:              "dO5TtRHk",
+						Shell:                          "e6q2ttES",
+						TLSSkipVerify:                  true,
+						Timeout:                        38483 * time.Second,
+						TTL:                            10943 * time.Second,
 						DeregisterCriticalServiceAfter: 68787 * time.Second,
 					},
 				},
 			},
 		},
-		SerfAdvertiseAddrLAN:                        tcpAddr("17.99.29.16:8301"),
-		SerfAdvertiseAddrWAN:                        tcpAddr("78.63.37.19:8302"),
-		SerfBindAddrLAN:                             tcpAddr("99.43.63.15:8301"),
-		SerfBindAddrWAN:                             tcpAddr("67.88.33.19:8302"),
-		SessionTTLMin:                               26627 * time.Second,
-		SkipLeaveOnInt:                              true,
-		StartJoinAddrsLAN:                           []string{"LR3hGDoG", "MwVpZ4Up"},
-		StartJoinAddrsWAN:                           []string{"EbFSc3nA", "kwXTh623"},
-		SyslogFacility:                              "hHv79Uia",
-		TelemetryCirconusAPIApp:                     "p4QOTe9j",
-		TelemetryCirconusAPIToken:                   "E3j35V23",
-		TelemetryCirconusAPIURL:                     "mEMjHpGg",
-		TelemetryCirconusBrokerID:                   "BHlxUhed",
-		TelemetryCirconusBrokerSelectTag:            "13xy1gHm",
-		TelemetryCirconusCheckDisplayName:           "DRSlQR6n",
-		TelemetryCirconusCheckForceMetricActivation: "Ua5FGVYf",
-		TelemetryCirconusCheckID:                    "kGorutad",
-		TelemetryCirconusCheckInstanceID:            "rwoOL6R4",
-		TelemetryCirconusCheckSearchTag:             "ovT4hT4f",
-		TelemetryCirconusCheckTags:                  "prvO4uBl",
-		TelemetryCirconusSubmissionInterval:         "DolzaflP",
-		TelemetryCirconusSubmissionURL:              "gTcbS93G",
-		TelemetryDisableHostname:                    true,
-		TelemetryDogstatsdAddr:                      "0wSndumK",
-		TelemetryDogstatsdTags:                      []string{"3N81zSUB", "Xtj8AnXZ"},
-		TelemetryFilterDefault:                      true,
-		TelemetryAllowedPrefixes:                    []string{"oJotS8XJ", "consul.consul"},
-		TelemetryBlockedPrefixes:                    []string{"cazlEhGn"},
-		TelemetryMetricsPrefix:                      "ftO6DySn",
-		TelemetryStatsdAddr:                         "drce87cy",
-		TelemetryStatsiteAddr:                       "HpFwKB8R",
-		TLSCipherSuites:                             []uint16{tls.TLS_RSA_WITH_RC4_128_SHA, tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA},
-		TLSMinVersion:                               "pAOWafkR",
-		TLSPreferServerCipherSuites:                 true,
+		SerfAdvertiseAddrLAN: tcpAddr("17.99.29.16:8301"),
+		SerfAdvertiseAddrWAN: tcpAddr("78.63.37.19:8302"),
+		SerfBindAddrLAN:      tcpAddr("99.43.63.15:8301"),
+		SerfBindAddrWAN:      tcpAddr("67.88.33.19:8302"),
+		SessionTTLMin:        26627 * time.Second,
+		SkipLeaveOnInt:       true,
+		StartJoinAddrsLAN:    []string{"LR3hGDoG", "MwVpZ4Up"},
+		StartJoinAddrsWAN:    []string{"EbFSc3nA", "kwXTh623"},
+		SyslogFacility:       "hHv79Uia",
+		Telemetry: lib.TelemetryConfig{
+			CirconusAPIApp:                     "p4QOTe9j",
+			CirconusAPIToken:                   "E3j35V23",
+			CirconusAPIURL:                     "mEMjHpGg",
+			CirconusBrokerID:                   "BHlxUhed",
+			CirconusBrokerSelectTag:            "13xy1gHm",
+			CirconusCheckDisplayName:           "DRSlQR6n",
+			CirconusCheckForceMetricActivation: "Ua5FGVYf",
+			CirconusCheckID:                    "kGorutad",
+			CirconusCheckInstanceID:            "rwoOL6R4",
+			CirconusCheckSearchTag:             "ovT4hT4f",
+			CirconusCheckTags:                  "prvO4uBl",
+			CirconusSubmissionInterval:         "DolzaflP",
+			CirconusSubmissionURL:              "gTcbS93G",
+			DisableHostname:                    true,
+			DogstatsdAddr:                      "0wSndumK",
+			DogstatsdTags:                      []string{"3N81zSUB", "Xtj8AnXZ"},
+			FilterDefault:                      true,
+			AllowedPrefixes:                    []string{"oJotS8XJ"},
+			BlockedPrefixes:                    []string{"cazlEhGn"},
+			MetricsPrefix:                      "ftO6DySn",
+			PrometheusRetentionTime:            15 * time.Second,
+			StatsdAddr:                         "drce87cy",
+			StatsiteAddr:                       "HpFwKB8R",
+		},
+		TLSCipherSuites:             []uint16{tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305, tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384},
+		TLSMinVersion:               "pAOWafkR",
+		TLSPreferServerCipherSuites: true,
 		TaggedAddresses: map[string]string{
 			"7MYgHrYH": "dALJAhLD",
 			"h6DdBy6K": "ebrr9zZ8",
@@ -3564,6 +4540,7 @@ func TestFullConfig(t *testing.T) {
 	}
 
 	warns := []string{
+		`The 'acl_datacenter' field is deprecated. Use the 'primary_datacenter' field instead.`,
 		`bootstrap_expect > 0: expecting 53 servers`,
 	}
 
@@ -3656,7 +4633,7 @@ func nonZero(name string, uniq map[interface{}]string, v interface{}) error {
 
 	isUnique := func(v interface{}) error {
 		if other := uniq[v]; other != "" {
-			return fmt.Errorf("%q and %q both use vaule %q", name, other, v)
+			return fmt.Errorf("%q and %q both use value %q", name, other, v)
 		}
 		uniq[v] = name
 		return nil
@@ -3823,6 +4800,7 @@ func TestSanitize(t *testing.T) {
 			&net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5678},
 			&net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5678},
 		},
+		DNSSOA: RuntimeSOAConfig{Refresh: 3600, Retry: 600, Expire: 86400, Minttl: 0},
 		HTTPAddrs: []net.Addr{
 			&net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5678},
 			&net.UnixAddr{Name: "/var/run/foo"},
@@ -3841,6 +4819,10 @@ func TestSanitize(t *testing.T) {
 				Check: structs.CheckType{
 					Name: "blurb",
 				},
+				Weights: &structs.Weights{
+					Passing: 67,
+					Warning: 3,
+				},
 			},
 		},
 		Checks: []*structs.CheckDefinition{
@@ -3852,251 +4834,495 @@ func TestSanitize(t *testing.T) {
 	}
 
 	rtJSON := `{
-    "ACLAgentMasterToken": "hidden",
-    "ACLAgentToken": "hidden",
-    "ACLDatacenter": "",
-    "ACLDefaultPolicy": "",
-    "ACLDisabledTTL": "0s",
-    "ACLDownPolicy": "",
-    "ACLEnableKeyListPolicy": false,
-    "ACLEnforceVersion8": false,
-    "ACLMasterToken": "hidden",
-    "ACLReplicationToken": "hidden",
-    "ACLTTL": "0s",
-    "ACLToken": "hidden",
-    "AEInterval": "0s",
-    "AdvertiseAddrLAN": "",
-    "AdvertiseAddrWAN": "",
-    "AutopilotCleanupDeadServers": false,
-    "AutopilotDisableUpgradeMigration": false,
-    "AutopilotLastContactThreshold": "0s",
-    "AutopilotMaxTrailingLogs": 0,
-    "AutopilotRedundancyZoneTag": "",
-    "AutopilotServerStabilizationTime": "0s",
-    "AutopilotUpgradeVersionTag": "",
-    "BindAddr": "127.0.0.1",
-    "Bootstrap": false,
-    "BootstrapExpect": 0,
-    "CAFile": "",
-    "CAPath": "",
-    "CertFile": "",
-    "CheckDeregisterIntervalMin": "0s",
-    "CheckReapInterval": "0s",
-    "CheckUpdateInterval": "0s",
-    "Checks": [
-        {
-            "DeregisterCriticalServiceAfter": "0s",
-            "DockerContainerID": "",
-            "HTTP": "",
-            "Header": {},
-            "ID": "",
-            "Interval": "0s",
-            "Method": "",
-            "Name": "zoo",
-            "Notes": "",
-            "Script": "",
-            "ScriptArgs": [],
-            "ServiceID": "",
-            "Shell": "",
-            "Status": "",
-            "TCP": "",
-            "TLSSkipVerify": false,
-            "TTL": "0s",
-            "Timeout": "0s",
-            "Token": "hidden"
-        }
-    ],
-    "ClientAddrs": [],
-    "ConsulCoordinateUpdateBatchSize": 0,
-    "ConsulCoordinateUpdateMaxBatches": 0,
-    "ConsulCoordinateUpdatePeriod": "15s",
-    "ConsulRaftElectionTimeout": "0s",
-    "ConsulRaftHeartbeatTimeout": "0s",
-    "ConsulRaftLeaderLeaseTimeout": "0s",
-    "ConsulSerfLANGossipInterval": "0s",
-    "ConsulSerfLANProbeInterval": "0s",
-    "ConsulSerfLANProbeTimeout": "0s",
-    "ConsulSerfLANSuspicionMult": 0,
-    "ConsulSerfWANGossipInterval": "0s",
-    "ConsulSerfWANProbeInterval": "0s",
-    "ConsulSerfWANProbeTimeout": "0s",
-    "ConsulSerfWANSuspicionMult": 0,
-    "ConsulServerHealthInterval": "0s",
-    "DNSAddrs": [
-        "tcp://1.2.3.4:5678",
-        "udp://1.2.3.4:5678"
-    ],
-    "DNSAllowStale": false,
-    "DNSDisableCompression": false,
-    "DNSDomain": "",
-    "DNSEnableTruncate": false,
-    "DNSMaxStale": "0s",
-    "DNSNodeTTL": "0s",
-    "DNSOnlyPassing": false,
-    "DNSPort": 0,
-    "DNSRecursorTimeout": "0s",
-    "DNSRecursors": [],
-    "DNSServiceTTL": {},
-    "DNSUDPAnswerLimit": 0,
-    "DataDir": "",
-    "Datacenter": "",
-    "DevMode": false,
-    "DisableAnonymousSignature": false,
-    "DisableCoordinates": false,
-    "DisableHostNodeID": false,
-    "DisableKeyringFile": false,
-    "DisableRemoteExec": false,
-    "DisableUpdateCheck": false,
-    "DiscardCheckOutput": false,
-    "EnableACLReplication": false,
-    "EnableAgentTLSForChecks": false,
-    "EnableDebug": false,
-    "EnableScriptChecks": false,
-    "EnableSyslog": false,
-    "EnableUI": false,
-    "EncryptKey": "hidden",
-    "EncryptVerifyIncoming": false,
-    "EncryptVerifyOutgoing": false,
-    "HTTPAddrs": [
-        "tcp://1.2.3.4:5678",
-        "unix:///var/run/foo"
-    ],
-    "HTTPBlockEndpoints": [],
-    "HTTPPort": 0,
-    "HTTPResponseHeaders": {},
-    "HTTPSAddrs": [],
-    "HTTPSPort": 0,
-    "KeyFile": "hidden",
-    "LeaveDrainTime": "0s",
-    "LeaveOnTerm": false,
-    "LogLevel": "",
-    "NodeID": "",
-    "NodeMeta": {},
-    "NodeName": "",
-    "NonVotingServer": false,
-    "PidFile": "",
-    "RPCAdvertiseAddr": "",
-    "RPCBindAddr": "",
-    "RPCHoldTimeout": "0s",
-    "RPCMaxBurst": 0,
-    "RPCProtocol": 0,
-    "RPCRateLimit": 0,
-    "RaftProtocol": 0,
-    "ReconnectTimeoutLAN": "0s",
-    "ReconnectTimeoutWAN": "0s",
-    "RejoinAfterLeave": false,
-    "RetryJoinIntervalLAN": "0s",
-    "RetryJoinIntervalWAN": "0s",
-    "RetryJoinLAN": [
-        "foo=bar key=hidden secret=hidden bang=bar"
-    ],
-    "RetryJoinMaxAttemptsLAN": 0,
-    "RetryJoinMaxAttemptsWAN": 0,
-    "RetryJoinWAN": [
-        "wan_foo=bar wan_key=hidden wan_secret=hidden wan_bang=bar"
-    ],
-    "Revision": "",
-    "SegmentLimit": 0,
-    "SegmentName": "",
-    "SegmentNameLimit": 0,
-    "Segments": [],
-    "SerfAdvertiseAddrLAN": "tcp://1.2.3.4:5678",
-    "SerfAdvertiseAddrWAN": "",
-    "SerfBindAddrLAN": "",
-    "SerfBindAddrWAN": "",
-    "SerfPortLAN": 0,
-    "SerfPortWAN": 0,
-    "ServerMode": false,
-    "ServerName": "",
-    "ServerPort": 0,
-    "Services": [
-        {
-            "Address": "",
-            "Check": {
-                "CheckID": "",
-                "DeregisterCriticalServiceAfter": "0s",
-                "DockerContainerID": "",
-                "HTTP": "",
-                "Header": {},
-                "Interval": "0s",
-                "Method": "",
-                "Name": "blurb",
-                "Notes": "",
-                "Script": "",
-                "ScriptArgs": [],
-                "Shell": "",
-                "Status": "",
-                "TCP": "",
-                "TLSSkipVerify": false,
-                "TTL": "0s",
-                "Timeout": "0s"
-            },
-            "Checks": [],
-            "EnableTagOverride": false,
-            "ID": "",
-            "Name": "foo",
-            "Port": 0,
-            "Tags": [],
-            "Token": "hidden"
-        }
-    ],
-    "SessionTTLMin": "0s",
-    "SkipLeaveOnInt": false,
-    "StartJoinAddrsLAN": [],
-    "StartJoinAddrsWAN": [],
-    "SyncCoordinateIntervalMin": "0s",
-    "SyncCoordinateRateTarget": 0,
-    "SyslogFacility": "",
-    "TLSCipherSuites": [],
-    "TLSMinVersion": "",
-    "TLSPreferServerCipherSuites": false,
-    "TaggedAddresses": {},
-    "TelemetryAllowedPrefixes": [],
-    "TelemetryBlockedPrefixes": [],
-    "TelemetryCirconusAPIApp": "",
-    "TelemetryCirconusAPIToken": "hidden",
-    "TelemetryCirconusAPIURL": "",
-    "TelemetryCirconusBrokerID": "",
-    "TelemetryCirconusBrokerSelectTag": "",
-    "TelemetryCirconusCheckDisplayName": "",
-    "TelemetryCirconusCheckForceMetricActivation": "",
-    "TelemetryCirconusCheckID": "",
-    "TelemetryCirconusCheckInstanceID": "",
-    "TelemetryCirconusCheckSearchTag": "",
-    "TelemetryCirconusCheckTags": "",
-    "TelemetryCirconusSubmissionInterval": "",
-    "TelemetryCirconusSubmissionURL": "",
-    "TelemetryDisableHostname": false,
-    "TelemetryDogstatsdAddr": "",
-    "TelemetryDogstatsdTags": [],
-    "TelemetryFilterDefault": false,
-    "TelemetryMetricsPrefix": "",
-    "TelemetryStatsdAddr": "",
-    "TelemetryStatsiteAddr": "",
-    "TranslateWANAddrs": false,
-    "UIDir": "",
-    "UnixSocketGroup": "",
-    "UnixSocketMode": "",
-    "UnixSocketUser": "",
-    "VerifyIncoming": false,
-    "VerifyIncomingHTTPS": false,
-    "VerifyIncomingRPC": false,
-    "VerifyOutgoing": false,
-    "VerifyServerHostname": false,
-    "Version": "",
-    "VersionPrerelease": "",
-    "Watches": []
-}`
-
+		"ACLAgentMasterToken": "hidden",
+		"ACLAgentToken": "hidden",
+		"ACLDatacenter": "",
+		"ACLDefaultPolicy": "",
+		"ACLDisabledTTL": "0s",
+		"ACLDownPolicy": "",
+		"ACLEnableKeyListPolicy": false,
+		"ACLEnforceVersion8": false,
+		"ACLMasterToken": "hidden",
+		"ACLPolicyTTL": "0s",
+		"ACLReplicationToken": "hidden",
+		"ACLTokenReplication": false,
+		"ACLTokenTTL": "0s",
+		"ACLToken": "hidden",
+		"ACLsEnabled": false,
+		"AEInterval": "0s",
+		"AdvertiseAddrLAN": "",
+		"AdvertiseAddrWAN": "",
+		"AutopilotCleanupDeadServers": false,
+		"AutopilotDisableUpgradeMigration": false,
+		"AutopilotLastContactThreshold": "0s",
+		"AutopilotMaxTrailingLogs": 0,
+		"AutopilotRedundancyZoneTag": "",
+		"AutopilotServerStabilizationTime": "0s",
+		"AutopilotUpgradeVersionTag": "",
+		"BindAddr": "127.0.0.1",
+		"Bootstrap": false,
+		"BootstrapExpect": 0,
+		"CAFile": "",
+		"CAPath": "",
+		"CertFile": "",
+		"CheckDeregisterIntervalMin": "0s",
+		"CheckReapInterval": "0s",
+		"CheckUpdateInterval": "0s",
+		"Checks": [{
+			"AliasNode": "",
+			"AliasService": "",
+			"DeregisterCriticalServiceAfter": "0s",
+			"DockerContainerID": "",
+			"GRPC": "",
+			"GRPCUseTLS": false,
+			"HTTP": "",
+			"Header": {},
+			"ID": "",
+			"Interval": "0s",
+			"Method": "",
+			"Name": "zoo",
+			"Notes": "",
+			"ScriptArgs": [],
+			"ServiceID": "",
+			"Shell": "",
+			"Status": "",
+			"TCP": "",
+			"TLSSkipVerify": false,
+			"TTL": "0s",
+			"Timeout": "0s",
+			"Token": "hidden"
+		}],
+		"ClientAddrs": [],
+		"ConnectCAConfig": {},
+		"ConnectCAProvider": "",
+		"ConnectEnabled": false,
+		"ConnectProxyAllowManagedAPIRegistration": false,
+		"ConnectProxyAllowManagedRoot": false,
+		"ConnectProxyBindMaxPort": 0,
+		"ConnectProxyBindMinPort": 0,
+		"ConnectProxyDefaultConfig": {},
+		"ConnectProxyDefaultDaemonCommand": [],
+		"ConnectProxyDefaultExecMode": "",
+		"ConnectProxyDefaultScriptCommand": [],
+		"ConnectSidecarMaxPort": 0,
+		"ConnectSidecarMinPort": 0,
+		"ConnectReplicationToken": "hidden",
+		"ConnectTestDisableManagedProxies": false,
+		"ConsulCoordinateUpdateBatchSize": 0,
+		"ConsulCoordinateUpdateMaxBatches": 0,
+		"ConsulCoordinateUpdatePeriod": "15s",
+		"ConsulRaftElectionTimeout": "0s",
+		"ConsulRaftHeartbeatTimeout": "0s",
+		"ConsulRaftLeaderLeaseTimeout": "0s",
+		"GossipLANGossipInterval": "0s",
+		"GossipLANGossipNodes": 0,
+		"GossipLANProbeInterval": "0s",
+		"GossipLANProbeTimeout": "0s",
+		"GossipLANRetransmitMult": 0,
+		"GossipLANSuspicionMult": 0,
+		"GossipWANGossipInterval": "0s",
+		"GossipWANGossipNodes": 0,
+		"GossipWANProbeInterval": "0s",
+		"GossipWANProbeTimeout": "0s",
+		"GossipWANRetransmitMult": 0,
+		"GossipWANSuspicionMult": 0,
+		"ConsulServerHealthInterval": "0s",
+		"DNSARecordLimit": 0,
+		"DNSAddrs": [
+			"tcp://1.2.3.4:5678",
+			"udp://1.2.3.4:5678"
+		],
+		"DNSAllowStale": false,
+		"DNSDisableCompression": false,
+		"DNSDomain": "",
+		"DNSEnableTruncate": false,
+		"DNSMaxStale": "0s",
+		"DNSNodeMetaTXT": false,
+		"DNSNodeTTL": "0s",
+		"DNSOnlyPassing": false,
+		"DNSPort": 0,
+		"DNSRecursorTimeout": "0s",
+		"DNSRecursors": [],
+		"DNSServiceTTL": {},
+		"DNSSOA": {
+			"Refresh": 3600,
+			"Retry": 600,
+			"Expire": 86400,
+			"Minttl": 0
+		},
+		"DNSUDPAnswerLimit": 0,
+		"DataDir": "",
+		"Datacenter": "",
+		"DevMode": false,
+		"DisableAnonymousSignature": false,
+		"DisableCoordinates": false,
+		"DisableHTTPUnprintableCharFilter": false,
+		"DisableHostNodeID": false,
+		"DisableKeyringFile": false,
+		"DisableRemoteExec": false,
+		"DisableUpdateCheck": false,
+		"DiscardCheckOutput": false,
+		"DiscoveryMaxStale": "0s",
+		"EnableAgentTLSForChecks": false,
+		"EnableDebug": false,
+		"EnableLocalScriptChecks": false,
+		"EnableRemoteScriptChecks": false,
+		"EnableSyslog": false,
+		"EnableUI": false,
+		"EncryptKey": "hidden",
+		"EncryptVerifyIncoming": false,
+		"EncryptVerifyOutgoing": false,
+		"GRPCAddrs": [],
+		"GRPCPort": 0,
+		"HTTPAddrs": [
+			"tcp://1.2.3.4:5678",
+			"unix:///var/run/foo"
+		],
+		"HTTPBlockEndpoints": [],
+		"HTTPPort": 0,
+		"HTTPResponseHeaders": {},
+		"HTTPSAddrs": [],
+		"HTTPSPort": 0,
+		"KeyFile": "hidden",
+		"LeaveDrainTime": "0s",
+		"LeaveOnTerm": false,
+		"LogLevel": "",
+		"LogFile": "",
+		"LogRotateBytes": 0,
+		"LogRotateDuration": "0s",
+		"NodeID": "",
+		"NodeMeta": {},
+		"NodeName": "",
+		"NonVotingServer": false,
+		"PidFile": "",
+		"PrimaryDatacenter": "",
+		"RPCAdvertiseAddr": "",
+		"RPCBindAddr": "",
+		"RPCHoldTimeout": "0s",
+		"RPCMaxBurst": 0,
+		"RPCProtocol": 0,
+		"RPCRateLimit": 0,
+		"RaftProtocol": 0,
+		"RaftSnapshotInterval": "0s",
+		"RaftSnapshotThreshold": 0,
+		"ReconnectTimeoutLAN": "0s",
+		"ReconnectTimeoutWAN": "0s",
+		"RejoinAfterLeave": false,
+		"RetryJoinIntervalLAN": "0s",
+		"RetryJoinIntervalWAN": "0s",
+		"RetryJoinLAN": [
+			"foo=bar key=hidden secret=hidden bang=bar"
+		],
+		"RetryJoinMaxAttemptsLAN": 0,
+		"RetryJoinMaxAttemptsWAN": 0,
+		"RetryJoinWAN": [
+			"wan_foo=bar wan_key=hidden wan_secret=hidden wan_bang=bar"
+		],
+		"Revision": "",
+		"SegmentLimit": 0,
+		"SegmentName": "",
+		"SegmentNameLimit": 0,
+		"Segments": [],
+		"SerfAdvertiseAddrLAN": "tcp://1.2.3.4:5678",
+		"SerfAdvertiseAddrWAN": "",
+		"SerfBindAddrLAN": "",
+		"SerfBindAddrWAN": "",
+		"SerfPortLAN": 0,
+		"SerfPortWAN": 0,
+		"ServerMode": false,
+		"ServerName": "",
+		"ServerPort": 0,
+		"Services": [{
+			"Address": "",
+			"Check": {
+				"AliasNode": "",
+				"AliasService": "",
+				"CheckID": "",
+				"DeregisterCriticalServiceAfter": "0s",
+				"DockerContainerID": "",
+				"GRPC": "",
+				"GRPCUseTLS": false,
+				"HTTP": "",
+				"Header": {},
+				"Interval": "0s",
+				"Method": "",
+				"Name": "blurb",
+				"Notes": "",
+				"ScriptArgs": [],
+				"Shell": "",
+				"Status": "",
+				"TCP": "",
+				"TLSSkipVerify": false,
+				"TTL": "0s",
+				"Timeout": "0s"
+			},
+			"Checks": [],
+			"Connect": null,
+			"EnableTagOverride": false,
+			"ID": "",
+			"Kind": "",
+			"Meta": {},
+			"Name": "foo",
+			"Port": 0,
+			"Proxy": null,
+			"ProxyDestination": "",
+			"Tags": [],
+			"Token": "hidden",
+			"Weights": {
+				"Passing": 67,
+				"Warning": 3
+			}
+		}],
+		"SessionTTLMin": "0s",
+		"SkipLeaveOnInt": false,
+		"StartJoinAddrsLAN": [],
+		"StartJoinAddrsWAN": [],
+		"SyncCoordinateIntervalMin": "0s",
+		"SyncCoordinateRateTarget": 0,
+		"SyslogFacility": "",
+		"TLSCipherSuites": [],
+		"TLSMinVersion": "",
+		"TLSPreferServerCipherSuites": false,
+		"TaggedAddresses": {},
+		"Telemetry": {
+			"AllowedPrefixes": [],
+			"BlockedPrefixes": [],
+			"CirconusAPIApp": "",
+			"CirconusAPIToken": "hidden",
+			"CirconusAPIURL": "",
+			"CirconusBrokerID": "",
+			"CirconusBrokerSelectTag": "",
+			"CirconusCheckDisplayName": "",
+			"CirconusCheckForceMetricActivation": "",
+			"CirconusCheckID": "",
+			"CirconusCheckInstanceID": "",
+			"CirconusCheckSearchTag": "",
+			"CirconusCheckTags": "",
+			"CirconusSubmissionInterval": "",
+			"CirconusSubmissionURL": "",
+			"DisableHostname": false,
+			"DogstatsdAddr": "",
+			"DogstatsdTags": [],
+			"FilterDefault": false,
+			"MetricsPrefix": "",
+			"PrometheusRetentionTime": "0s",
+			"StatsdAddr": "",
+			"StatsiteAddr": ""
+		},
+		"TranslateWANAddrs": false,
+		"UIDir": "",
+		"UnixSocketGroup": "",
+		"UnixSocketMode": "",
+		"UnixSocketUser": "",
+		"VerifyIncoming": false,
+		"VerifyIncomingHTTPS": false,
+		"VerifyIncomingRPC": false,
+		"VerifyOutgoing": false,
+		"VerifyServerHostname": false,
+		"Version": "",
+		"VersionPrerelease": "",
+		"Watches": []
+	}`
 	b, err := json.MarshalIndent(rt.Sanitized(), "", "    ")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(b), rtJSON; got != want {
-		dmp := diffmatchpatch.New()
-		diffs := dmp.DiffMain(want, got, false)
-		t.Fatal(dmp.DiffPrettyText(diffs))
+	require.JSONEq(t, rtJSON, string(b))
+}
+
+func TestRuntime_apiAddresses(t *testing.T) {
+	rt := RuntimeConfig{
+		HTTPAddrs: []net.Addr{
+			&net.TCPAddr{IP: net.ParseIP("198.18.0.1"), Port: 5678},
+			&net.UnixAddr{Name: "/var/run/foo"},
+		},
+		HTTPSAddrs: []net.Addr{
+			&net.TCPAddr{IP: net.ParseIP("198.18.0.2"), Port: 5678},
+		}}
+
+	unixAddrs, httpAddrs, httpsAddrs := rt.apiAddresses(1)
+
+	require.Len(t, unixAddrs, 1)
+	require.Len(t, httpAddrs, 1)
+	require.Len(t, httpsAddrs, 1)
+
+	require.Equal(t, "/var/run/foo", unixAddrs[0])
+	require.Equal(t, "198.18.0.1:5678", httpAddrs[0])
+	require.Equal(t, "198.18.0.2:5678", httpsAddrs[0])
+}
+
+func TestRuntime_APIConfigHTTPS(t *testing.T) {
+	rt := RuntimeConfig{
+		HTTPAddrs: []net.Addr{
+			&net.TCPAddr{IP: net.ParseIP("198.18.0.1"), Port: 5678},
+			&net.UnixAddr{Name: "/var/run/foo"},
+		},
+		HTTPSAddrs: []net.Addr{
+			&net.TCPAddr{IP: net.ParseIP("198.18.0.2"), Port: 5678},
+		},
+		Datacenter:     "dc-test",
+		CAFile:         "/etc/consul/ca.crt",
+		CAPath:         "/etc/consul/ca.dir",
+		CertFile:       "/etc/consul/server.crt",
+		KeyFile:        "/etc/consul/ssl/server.key",
+		VerifyOutgoing: false,
 	}
+
+	cfg, err := rt.APIConfig(false)
+	require.NoError(t, err)
+	require.Equal(t, "198.18.0.2:5678", cfg.Address)
+	require.Equal(t, "https", cfg.Scheme)
+	require.Equal(t, rt.CAFile, cfg.TLSConfig.CAFile)
+	require.Equal(t, rt.CAPath, cfg.TLSConfig.CAPath)
+	require.Equal(t, "", cfg.TLSConfig.CertFile)
+	require.Equal(t, "", cfg.TLSConfig.KeyFile)
+	require.Equal(t, rt.Datacenter, cfg.Datacenter)
+	require.Equal(t, true, cfg.TLSConfig.InsecureSkipVerify)
+
+	rt.VerifyOutgoing = true
+	cfg, err = rt.APIConfig(true)
+	require.NoError(t, err)
+	require.Equal(t, "198.18.0.2:5678", cfg.Address)
+	require.Equal(t, "https", cfg.Scheme)
+	require.Equal(t, rt.CAFile, cfg.TLSConfig.CAFile)
+	require.Equal(t, rt.CAPath, cfg.TLSConfig.CAPath)
+	require.Equal(t, rt.CertFile, cfg.TLSConfig.CertFile)
+	require.Equal(t, rt.KeyFile, cfg.TLSConfig.KeyFile)
+	require.Equal(t, rt.Datacenter, cfg.Datacenter)
+	require.Equal(t, false, cfg.TLSConfig.InsecureSkipVerify)
+}
+
+func TestRuntime_APIConfigHTTP(t *testing.T) {
+	rt := RuntimeConfig{
+		HTTPAddrs: []net.Addr{
+			&net.UnixAddr{Name: "/var/run/foo"},
+			&net.TCPAddr{IP: net.ParseIP("198.18.0.1"), Port: 5678},
+		},
+		Datacenter: "dc-test",
+	}
+
+	cfg, err := rt.APIConfig(false)
+	require.NoError(t, err)
+	require.Equal(t, rt.Datacenter, cfg.Datacenter)
+	require.Equal(t, "198.18.0.1:5678", cfg.Address)
+	require.Equal(t, "http", cfg.Scheme)
+	require.Equal(t, "", cfg.TLSConfig.CAFile)
+	require.Equal(t, "", cfg.TLSConfig.CAPath)
+	require.Equal(t, "", cfg.TLSConfig.CertFile)
+	require.Equal(t, "", cfg.TLSConfig.KeyFile)
+}
+
+func TestRuntime_APIConfigUNIX(t *testing.T) {
+	rt := RuntimeConfig{
+		HTTPAddrs: []net.Addr{
+			&net.UnixAddr{Name: "/var/run/foo"},
+		},
+		Datacenter: "dc-test",
+	}
+
+	cfg, err := rt.APIConfig(false)
+	require.NoError(t, err)
+	require.Equal(t, rt.Datacenter, cfg.Datacenter)
+	require.Equal(t, "unix:///var/run/foo", cfg.Address)
+	require.Equal(t, "http", cfg.Scheme)
+	require.Equal(t, "", cfg.TLSConfig.CAFile)
+	require.Equal(t, "", cfg.TLSConfig.CAPath)
+	require.Equal(t, "", cfg.TLSConfig.CertFile)
+	require.Equal(t, "", cfg.TLSConfig.KeyFile)
+}
+
+func TestRuntime_APIConfigANYAddrV4(t *testing.T) {
+	rt := RuntimeConfig{
+		HTTPAddrs: []net.Addr{
+			&net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: 5678},
+		},
+		Datacenter: "dc-test",
+	}
+
+	cfg, err := rt.APIConfig(false)
+	require.NoError(t, err)
+	require.Equal(t, rt.Datacenter, cfg.Datacenter)
+	require.Equal(t, "127.0.0.1:5678", cfg.Address)
+	require.Equal(t, "http", cfg.Scheme)
+	require.Equal(t, "", cfg.TLSConfig.CAFile)
+	require.Equal(t, "", cfg.TLSConfig.CAPath)
+	require.Equal(t, "", cfg.TLSConfig.CertFile)
+	require.Equal(t, "", cfg.TLSConfig.KeyFile)
+}
+
+func TestRuntime_APIConfigANYAddrV6(t *testing.T) {
+	rt := RuntimeConfig{
+		HTTPAddrs: []net.Addr{
+			&net.TCPAddr{IP: net.ParseIP("::"), Port: 5678},
+		},
+		Datacenter: "dc-test",
+	}
+
+	cfg, err := rt.APIConfig(false)
+	require.NoError(t, err)
+	require.Equal(t, rt.Datacenter, cfg.Datacenter)
+	require.Equal(t, "[::1]:5678", cfg.Address)
+	require.Equal(t, "http", cfg.Scheme)
+	require.Equal(t, "", cfg.TLSConfig.CAFile)
+	require.Equal(t, "", cfg.TLSConfig.CAPath)
+	require.Equal(t, "", cfg.TLSConfig.CertFile)
+	require.Equal(t, "", cfg.TLSConfig.KeyFile)
+}
+
+func TestRuntime_ClientAddress(t *testing.T) {
+	rt := RuntimeConfig{
+		HTTPAddrs: []net.Addr{
+			&net.TCPAddr{IP: net.ParseIP("::"), Port: 5678},
+			&net.TCPAddr{IP: net.ParseIP("198.18.0.1"), Port: 5679},
+			&net.UnixAddr{Name: "/var/run/foo", Net: "unix"},
+		},
+		HTTPSAddrs: []net.Addr{
+			&net.TCPAddr{IP: net.ParseIP("::"), Port: 5688},
+			&net.TCPAddr{IP: net.ParseIP("198.18.0.1"), Port: 5689},
+		},
+	}
+
+	unix, http, https := rt.ClientAddress()
+
+	require.Equal(t, "unix:///var/run/foo", unix)
+	require.Equal(t, "198.18.0.1:5679", http)
+	require.Equal(t, "198.18.0.1:5689", https)
+}
+
+func TestRuntime_ClientAddressAnyV4(t *testing.T) {
+	rt := RuntimeConfig{
+		HTTPAddrs: []net.Addr{
+			&net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: 5678},
+			&net.UnixAddr{Name: "/var/run/foo", Net: "unix"},
+		},
+		HTTPSAddrs: []net.Addr{
+			&net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: 5688},
+		},
+	}
+
+	unix, http, https := rt.ClientAddress()
+
+	require.Equal(t, "unix:///var/run/foo", unix)
+	require.Equal(t, "127.0.0.1:5678", http)
+	require.Equal(t, "127.0.0.1:5688", https)
+}
+
+func TestRuntime_ClientAddressAnyV6(t *testing.T) {
+	rt := RuntimeConfig{
+		HTTPAddrs: []net.Addr{
+			&net.TCPAddr{IP: net.ParseIP("::"), Port: 5678},
+			&net.UnixAddr{Name: "/var/run/foo", Net: "unix"},
+		},
+		HTTPSAddrs: []net.Addr{
+			&net.TCPAddr{IP: net.ParseIP("::"), Port: 5688},
+		},
+	}
+
+	unix, http, https := rt.ClientAddress()
+
+	require.Equal(t, "unix:///var/run/foo", unix)
+	require.Equal(t, "[::1]:5678", http)
+	require.Equal(t, "[::1]:5688", https)
 }
 
 func splitIPPort(hostport string) (net.IP, int) {

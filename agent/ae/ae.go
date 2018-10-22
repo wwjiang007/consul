@@ -47,7 +47,7 @@ type SyncState interface {
 // The state is synchronized on a regular basis or on demand when either
 // the state has changed or a new Consul server has joined the cluster.
 //
-// The regular state sychronization provides a self-healing mechanism
+// The regular state synchronization provides a self-healing mechanism
 // for the cluster which is also called anti-entropy.
 type StateSyncer struct {
 	// State contains the data that needs to be synchronized.
@@ -306,8 +306,9 @@ func (s *StateSyncer) Paused() bool {
 	return s.paused != 0
 }
 
-// Resume re-enables sync runs.
-func (s *StateSyncer) Resume() {
+// Resume re-enables sync runs. It returns true if it was the last pause/resume
+// pair on the stack and so actually caused the state syncer to resume.
+func (s *StateSyncer) Resume() bool {
 	s.pauseLock.Lock()
 	s.paused--
 	if s.paused < 0 {
@@ -318,4 +319,5 @@ func (s *StateSyncer) Resume() {
 	if trigger {
 		s.SyncChanges.Trigger()
 	}
+	return trigger
 }

@@ -23,7 +23,6 @@ func (s *Session) Apply(args *structs.SessionRequest, reply *string) error {
 	if done, err := s.srv.forward("Session.Apply", args, args, reply); done {
 		return err
 	}
-	defer metrics.MeasureSince([]string{"consul", "session", "apply"}, time.Now())
 	defer metrics.MeasureSince([]string{"session", "apply"}, time.Now())
 
 	// Verify the args
@@ -35,7 +34,7 @@ func (s *Session) Apply(args *structs.SessionRequest, reply *string) error {
 	}
 
 	// Fetch the ACL token, if any, and apply the policy.
-	rule, err := s.srv.resolveToken(args.Token)
+	rule, err := s.srv.ResolveToken(args.Token)
 	if err != nil {
 		return err
 	}
@@ -222,7 +221,6 @@ func (s *Session) Renew(args *structs.SessionSpecificRequest,
 	if done, err := s.srv.forward("Session.Renew", args, args, reply); done {
 		return err
 	}
-	defer metrics.MeasureSince([]string{"consul", "session", "renew"}, time.Now())
 	defer metrics.MeasureSince([]string{"session", "renew"}, time.Now())
 
 	// Get the session, from local state.
@@ -238,7 +236,7 @@ func (s *Session) Renew(args *structs.SessionSpecificRequest,
 	}
 
 	// Fetch the ACL token, if any, and apply the policy.
-	rule, err := s.srv.resolveToken(args.Token)
+	rule, err := s.srv.ResolveToken(args.Token)
 	if err != nil {
 		return err
 	}

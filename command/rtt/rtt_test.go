@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/consul/testrpc"
+
 	"github.com/hashicorp/consul/agent"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/testutil/retry"
@@ -52,12 +54,13 @@ func TestRTTCommand_LAN(t *testing.T) {
 		}
 	`)
 	defer a.Shutdown()
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
 	// Inject some known coordinates.
 	c1 := coordinate.NewCoordinate(coordinate.DefaultConfig())
 	c2 := c1.Clone()
 	c2.Vec[0] = 0.123
-	dist_str := fmt.Sprintf("%.3f ms", c1.DistanceTo(c2).Seconds()*1000.0)
+	distStr := fmt.Sprintf("%.3f ms", c1.DistanceTo(c2).Seconds()*1000.0)
 	{
 		req := structs.CoordinateUpdateRequest{
 			Datacenter: a.Config.Datacenter,
@@ -108,7 +111,7 @@ func TestRTTCommand_LAN(t *testing.T) {
 		}
 
 		// Make sure the proper RTT was reported in the output.
-		expected := fmt.Sprintf("rtt: %s", dist_str)
+		expected := fmt.Sprintf("rtt: %s", distStr)
 		if !strings.Contains(ui.OutputWriter.String(), expected) {
 			r.Fatalf("bad: %#v", ui.OutputWriter.String())
 		}
@@ -128,7 +131,7 @@ func TestRTTCommand_LAN(t *testing.T) {
 		}
 
 		// Make sure the proper RTT was reported in the output.
-		expected := fmt.Sprintf("rtt: %s", dist_str)
+		expected := fmt.Sprintf("rtt: %s", distStr)
 		if !strings.Contains(ui.OutputWriter.String(), expected) {
 			t.Fatalf("bad: %#v", ui.OutputWriter.String())
 		}
@@ -154,6 +157,7 @@ func TestRTTCommand_WAN(t *testing.T) {
 	t.Parallel()
 	a := agent.NewTestAgent(t.Name(), ``)
 	defer a.Shutdown()
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
 	node := fmt.Sprintf("%s.%s", a.Config.NodeName, a.Config.Datacenter)
 

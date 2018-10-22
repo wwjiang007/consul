@@ -25,12 +25,13 @@ This endpoint returns the checks specific to the node provided on the path.
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required             |
-| ---------------- | ----------------- | ------------------------ |
-| `YES`            | `all`             | `node:read,service:read` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required             |
+| ---------------- | ----------------- | ------------- | ------------------------ |
+| `YES`            | `all`             | `none`        | `node:read,service:read` |
 
 ### Parameters
 
@@ -45,7 +46,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/v1/health/node/my-node
+    http://127.0.0.1:8500/v1/health/node/my-node
 ```
 
 ### Sample Response
@@ -62,7 +63,7 @@ $ curl \
     "Output": "",
     "ServiceID": "",
     "ServiceName": "",
-    "ServiceTags": null
+    "ServiceTags": []
   },
   {
     "ID": "40e4a748-2192-161a-0510-9bf59fe950b5",
@@ -74,7 +75,7 @@ $ curl \
     "Output": "",
     "ServiceID": "redis",
     "ServiceName": "redis",
-    "ServiceTags": ["primary"] 
+    "ServiceTags": ["primary"]
   }
 ]
 ```
@@ -90,12 +91,13 @@ path.
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required             |
-| ---------------- | ----------------- | ------------------------ |
-| `YES`            | `all`             | `node:read,service:read` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required             |
+| ---------------- | ----------------- | ------------- | ------------------------ |
+| `YES`            | `all`             | `none`        | `node:read,service:read` |
 
 ### Parameters
 
@@ -120,7 +122,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/v1/health/checks/my-service
+    http://127.0.0.1:8500/v1/health/checks/my-service
 ```
 
 ### Sample Response
@@ -153,12 +155,13 @@ incorporating the use of health checks.
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required             |
-| ---------------- | ----------------- | ------------------------ |
-| `YES`            | `all`             | `node:read,service:read` |
+| Blocking Queries | Consistency Modes | Agent Caching        | ACL Required             |
+| ---------------- | ----------------- | -------------------- | ------------------------ |
+| `YES`            | `all`             | `background refresh` | `node:read,service:read` |
 
 ### Parameters
 
@@ -175,7 +178,9 @@ The table below shows this endpoint's support for
   part of the URL as a query parameter.
 
 - `tag` `(string: "")` - Specifies the tag to filter the list. This is
-  specifies as part of the URL as a query parameter.
+  specified as part of the URL as a query parameter. Can be used multiple times 
+  for additional filtering, returning only the results that include all of the tag 
+  values provided.
 
 - `node-meta` `(string: "")` - Specifies a desired node metadata key/value pair
   of the form `key:value`. This parameter can be specified multiple times, and
@@ -190,7 +195,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/v1/health/service/my-service
+    http://127.0.0.1:8500/v1/health/service/my-service
 ```
 
 ### Sample Response
@@ -216,7 +221,14 @@ $ curl \
       "Service": "redis",
       "Tags": ["primary"],
       "Address": "10.1.10.12",
-      "Port": 8000
+      "Meta": {
+        "redis_version": "4.0"
+      },
+      "Port": 8000,
+      "Weights": {
+        "Passing": 10,
+        "Warning": 1
+      }
     },
     "Checks": [
       {
@@ -239,12 +251,27 @@ $ curl \
         "Output": "",
         "ServiceID": "",
         "ServiceName": "",
-		"ServiceTags": null 
+        "ServiceTags": []
       }
     ]
   }
 ]
 ```
+
+## List Nodes for Connect-capable Service
+
+This endpoint returns the nodes providing a
+[Connect-capable](/docs/connect/index.html) service in a given datacenter.
+This will include both proxies and native integrations. A service may
+register both Connect-capable and incapable services at the same time,
+so this endpoint may be used to filter only the Connect-capable endpoints.
+
+| Method | Path                         | Produces                   |
+| ------ | ---------------------------- | -------------------------- |
+| `GET`  | `/health/connect/:service`   | `application/json`         |
+
+Parameters and response format are the same as
+[`/health/service/:service`](/api/health.html#list-nodes-for-service).
 
 ## List Checks in State
 
@@ -256,16 +283,17 @@ This endpoint returns the checks in the state provided on the path.
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required             |
-| ---------------- | ----------------- | ------------------------ |
-| `YES`            | `all`             | `node:read,service:read` |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required             |
+| ---------------- | ----------------- | ------------- | ------------------------ |
+| `YES`            | `all`             | `none`        | `node:read,service:read` |
 
 ### Parameters
 
-- `state` `(string: <required>)` - Specifies the state to query. Spported states
+- `state` `(string: <required>)` - Specifies the state to query. Supported states
   are `any`, `passing`, `warning`, or `critical`. The `any` state is a wildcard
   that can be used to return all checks.
 
@@ -287,7 +315,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/v1/health/state/passing
+    http://127.0.0.1:8500/v1/health/state/passing
 ```
 
 ### Sample Response
@@ -303,7 +331,7 @@ $ curl \
     "Output": "",
     "ServiceID": "",
     "ServiceName": "",
-	"ServiceTags": null
+    "ServiceTags": []
   },
   {
     "Node": "foobar",
@@ -314,7 +342,7 @@ $ curl \
     "Output": "",
     "ServiceID": "redis",
     "ServiceName": "redis",
-	"ServiceTags": ["primary"]
+	  "ServiceTags": ["primary"]
   }
 ]
 ```

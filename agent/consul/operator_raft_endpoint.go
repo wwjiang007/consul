@@ -18,7 +18,7 @@ func (op *Operator) RaftGetConfiguration(args *structs.DCSpecificRequest, reply 
 	}
 
 	// This action requires operator read access.
-	rule, err := op.srv.resolveToken(args.Token)
+	rule, err := op.srv.ResolveToken(args.Token)
 	if err != nil {
 		return err
 	}
@@ -80,7 +80,7 @@ func (op *Operator) RaftRemovePeerByAddress(args *structs.RaftRemovePeerRequest,
 
 	// This is a super dangerous operation that requires operator write
 	// access.
-	rule, err := op.srv.resolveToken(args.Token)
+	rule, err := op.srv.ResolveToken(args.Token)
 	if err != nil {
 		return err
 	}
@@ -115,7 +115,7 @@ REMOVE:
 	// doing if you are calling this. If you remove a peer that's known to
 	// Serf, for example, it will come back when the leader does a reconcile
 	// pass.
-	minRaftProtocol, err := ServerMinRaftProtocol(op.srv.serfLAN.Members())
+	minRaftProtocol, err := op.srv.autopilot.MinRaftProtocol()
 	if err != nil {
 		return err
 	}
@@ -147,7 +147,7 @@ func (op *Operator) RaftRemovePeerByID(args *structs.RaftRemovePeerRequest, repl
 
 	// This is a super dangerous operation that requires operator write
 	// access.
-	rule, err := op.srv.resolveToken(args.Token)
+	rule, err := op.srv.ResolveToken(args.Token)
 	if err != nil {
 		return err
 	}
@@ -182,7 +182,7 @@ REMOVE:
 	// doing if you are calling this. If you remove a peer that's known to
 	// Serf, for example, it will come back when the leader does a reconcile
 	// pass.
-	minRaftProtocol, err := ServerMinRaftProtocol(op.srv.serfLAN.Members())
+	minRaftProtocol, err := op.srv.autopilot.MinRaftProtocol()
 	if err != nil {
 		return err
 	}

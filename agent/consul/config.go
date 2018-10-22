@@ -7,7 +7,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/hashicorp/consul/agent/consul/autopilot"
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/tlsutil"
 	"github.com/hashicorp/consul/types"
 	"github.com/hashicorp/consul/version"
@@ -73,10 +75,14 @@ type Config struct {
 	// of nodes.
 	BootstrapExpect int
 
-	// Datacenter is the datacenter this Consul server represents
+	// Datacenter is the datacenter this Consul server represents.
 	Datacenter string
 
-	// DataDir is the directory to store our state in
+	// PrimaryDatacenter is the authoritative datacenter for features like ACLs
+	// and Connect.
+	PrimaryDatacenter string
+
+	// DataDir is the directory to store our state in.
 	DataDir string
 
 	// DevMode is used to enable a development server mode.
@@ -211,6 +217,13 @@ type Config struct {
 	// operators track which versions are actively deployed
 	Build string
 
+	// ACLEnabled is used to enable ACLs
+	ACLsEnabled bool
+
+	// ACLEnforceVersion8 is used to gate a set of ACL policy features that
+	// are opt-in prior to Consul 0.8 and opt-out in Consul 0.8 and later.
+	ACLEnforceVersion8 bool
+
 	// ACLMasterToken is used to bootstrap the ACL system. It should be specified
 	// on the servers in the ACLDatacenter. When the leader comes online, it ensures
 	// that the Master token is available. This provides the initial token.
@@ -220,10 +233,26 @@ type Config struct {
 	// tokens. If not provided, ACL verification is disabled.
 	ACLDatacenter string
 
-	// ACLTTL controls the time-to-live of cached ACL policies.
+	// ACLTokenTTL controls the time-to-live of cached ACL tokens.
 	// It can be set to zero to disable caching, but this adds
 	// a substantial cost.
-	ACLTTL time.Duration
+	ACLTokenTTL time.Duration
+
+	// ACLPolicyTTL controls the time-to-live of cached ACL policies.
+	// It can be set to zero to disable caching, but this adds
+	// a substantial cost.
+	ACLPolicyTTL time.Duration
+
+	// ACLDisabledTTL is the time between checking if ACLs should be
+	// enabled. This
+	ACLDisabledTTL time.Duration
+
+	// ACLTokenReplication is used to enabled token replication.
+	//
+	// By default policy-only replication is enabled. When token
+	// replication is off and the primary datacenter is not
+	// yet upgraded to the new ACLs no replication will be performed
+	ACLTokenReplication bool
 
 	// ACLDefaultPolicy is used to control the ACL interaction when
 	// there is no defined policy. This can be "allow" which means
@@ -233,29 +262,25 @@ type Config struct {
 
 	// ACLDownPolicy controls the behavior of ACLs if the ACLDatacenter
 	// cannot be contacted. It can be either "deny" to deny all requests,
-	// or "extend-cache" which ignores the ACLCacheInterval and uses
-	// cached policies. If a policy is not in the cache, it acts like deny.
+	// "extend-cache" or "async-cache" which ignores the ACLCacheInterval and
+	// uses cached policies.
+	// If a policy is not in the cache, it acts like deny.
 	// "allow" can be used to allow all requests. This is not recommended.
 	ACLDownPolicy string
 
-	// EnableACLReplication is used to control ACL replication.
-	EnableACLReplication bool
+	// ACLReplicationRate is the max number of replication rounds that can
+	// be run per second. Note that either 1 or 2 RPCs are used during each replication
+	// round
+	ACLReplicationRate int
 
-	// ACLReplicationInterval is the interval at which replication passes
-	// will occur. Queries to the ACLDatacenter may block, so replication
-	// can happen less often than this, but the interval forms the upper
-	// limit to how fast we will go if there was constant ACL churn on the
-	// remote end.
-	ACLReplicationInterval time.Duration
+	// ACLReplicationBurst is how many replication RPCs can be bursted after a
+	// period of idleness
+	ACLReplicationBurst int
 
 	// ACLReplicationApplyLimit is the max number of replication-related
 	// apply operations that we allow during a one second period. This is
 	// used to limit the amount of Raft bandwidth used for replication.
 	ACLReplicationApplyLimit int
-
-	// ACLEnforceVersion8 is used to gate a set of ACL policy features that
-	// are opt-in prior to Consul 0.8 and opt-out in Consul 0.8 and later.
-	ACLEnforceVersion8 bool
 
 	// ACLEnableKeyListPolicy is used to gate enforcement of the new "list" policy that
 	// protects listing keys by prefix. This behavior is opt-in
@@ -335,7 +360,7 @@ type Config struct {
 
 	// AutopilotConfig is used to apply the initial autopilot config when
 	// bootstrapping.
-	AutopilotConfig *structs.AutopilotConfig
+	AutopilotConfig *autopilot.Config
 
 	// ServerHealthInterval is the frequency with which the health of the
 	// servers in the cluster will be updated.
@@ -345,6 +370,16 @@ type Config struct {
 	// autopilot tasks, such as promoting eligible non-voters and removing
 	// dead servers.
 	AutopilotInterval time.Duration
+
+	// ConnectEnabled is whether to enable Connect features such as the CA.
+	ConnectEnabled bool
+
+	// CAConfig is used to apply the initial Connect CA configuration when
+	// bootstrapping.
+	CAConfig *structs.CAConfiguration
+
+	// ConnectReplicationToken is used to control Intention replication.
+	ConnectReplicationToken string
 }
 
 // CheckProtocolVersion validates the protocol version.
@@ -369,7 +404,7 @@ func (c *Config) CheckACL() error {
 	switch c.ACLDownPolicy {
 	case "allow":
 	case "deny":
-	case "extend-cache":
+	case "async-cache", "extend-cache":
 	default:
 		return fmt.Errorf("Unsupported down ACL policy: %s", c.ACLDownPolicy)
 	}
@@ -389,15 +424,17 @@ func DefaultConfig() *Config {
 		NodeName:                 hostname,
 		RPCAddr:                  DefaultRPCAddr,
 		RaftConfig:               raft.DefaultConfig(),
-		SerfLANConfig:            serf.DefaultConfig(),
-		SerfWANConfig:            serf.DefaultConfig(),
+		SerfLANConfig:            lib.SerfDefaultConfig(),
+		SerfWANConfig:            lib.SerfDefaultConfig(),
 		SerfFloodInterval:        60 * time.Second,
 		ReconcileInterval:        60 * time.Second,
 		ProtocolVersion:          ProtocolVersion2Compatible,
-		ACLTTL:                   30 * time.Second,
+		ACLPolicyTTL:             30 * time.Second,
+		ACLTokenTTL:              30 * time.Second,
 		ACLDefaultPolicy:         "allow",
 		ACLDownPolicy:            "extend-cache",
-		ACLReplicationInterval:   30 * time.Second,
+		ACLReplicationRate:       1,
+		ACLReplicationBurst:      5,
 		ACLReplicationApplyLimit: 100, // ops / sec
 		TombstoneTTL:             15 * time.Minute,
 		TombstoneTTLGranularity:  30 * time.Second,
@@ -415,12 +452,23 @@ func DefaultConfig() *Config {
 
 		TLSMinVersion: "tls10",
 
-		AutopilotConfig: &structs.AutopilotConfig{
+		// TODO (slackpad) - Until #3744 is done, we need to keep these
+		// in sync with agent/config/default.go.
+		AutopilotConfig: &autopilot.Config{
 			CleanupDeadServers:      true,
 			LastContactThreshold:    200 * time.Millisecond,
 			MaxTrailingLogs:         250,
 			ServerStabilizationTime: 10 * time.Second,
 		},
+
+		CAConfig: &structs.CAConfiguration{
+			Provider: "consul",
+			Config: map[string]interface{}{
+				"RotationPeriod": "2160h",
+				"LeafCertTTL":    "72h",
+			},
+		},
+
 		ServerHealthInterval: 2 * time.Second,
 		AutopilotInterval:    10 * time.Second,
 	}
@@ -444,8 +492,11 @@ func DefaultConfig() *Config {
 	// Disable shutdown on removal
 	conf.RaftConfig.ShutdownOnRemove = false
 
-	// Check every 5 seconds to see if there are enough new entries for a snapshot
-	conf.RaftConfig.SnapshotInterval = 5 * time.Second
+	// Check every 5 seconds to see if there are enough new entries for a snapshot, can be overridden
+	conf.RaftConfig.SnapshotInterval = 30 * time.Second
+
+	// Snapshots are created every 16384 entries by default, can be overridden
+	conf.RaftConfig.SnapshotThreshold = 16384
 
 	return conf
 }

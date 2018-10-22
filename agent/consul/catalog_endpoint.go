@@ -2,6 +2,7 @@ package consul
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/armon/go-metrics"
@@ -24,7 +25,6 @@ func (c *Catalog) Register(args *structs.RegisterRequest, reply *struct{}) error
 	if done, err := c.srv.forward("Catalog.Register", args, args, reply); done {
 		return err
 	}
-	defer metrics.MeasureSince([]string{"consul", "catalog", "register"}, time.Now())
 	defer metrics.MeasureSince([]string{"catalog", "register"}, time.Now())
 
 	// Verify the args.
@@ -41,13 +41,20 @@ func (c *Catalog) Register(args *structs.RegisterRequest, reply *struct{}) error
 	}
 
 	// Fetch the ACL token, if any.
-	rule, err := c.srv.resolveToken(args.Token)
+	rule, err := c.srv.ResolveToken(args.Token)
 	if err != nil {
 		return err
 	}
 
 	// Handle a service registration.
 	if args.Service != nil {
+		// Validate the service. This is in addition to the below since
+		// the above just hasn't been moved over yet. We should move it over
+		// in time.
+		if err := args.Service.Validate(); err != nil {
+			return err
+		}
+
 		// If no service id, but service name, use default
 		if args.Service.ID == "" && args.Service.Service != "" {
 			args.Service.ID = args.Service.Service
@@ -59,7 +66,7 @@ func (c *Catalog) Register(args *structs.RegisterRequest, reply *struct{}) error
 		}
 
 		// Check the service address here and in the agent endpoint
-		// since service registration isn't sychronous.
+		// since service registration isn't synchronous.
 		if ipaddr.IsAny(args.Service.Address) {
 			return fmt.Errorf("Invalid service address")
 		}
@@ -71,6 +78,13 @@ func (c *Catalog) Register(args *structs.RegisterRequest, reply *struct{}) error
 		// delete this and do all the ACL checks down there.
 		if args.Service.Service != structs.ConsulServiceName {
 			if rule != nil && !rule.ServiceWrite(args.Service.Service, nil) {
+				return acl.ErrPermissionDenied
+			}
+		}
+
+		// Proxies must have write permission on their destination
+		if args.Service.Kind == structs.ServiceKindConnectProxy {
+			if rule != nil && !rule.ServiceWrite(args.Service.Proxy.DestinationServiceName, nil) {
 				return acl.ErrPermissionDenied
 			}
 		}
@@ -117,7 +131,6 @@ func (c *Catalog) Deregister(args *structs.DeregisterRequest, reply *struct{}) e
 	if done, err := c.srv.forward("Catalog.Deregister", args, args, reply); done {
 		return err
 	}
-	defer metrics.MeasureSince([]string{"consul", "catalog", "deregister"}, time.Now())
 	defer metrics.MeasureSince([]string{"catalog", "deregister"}, time.Now())
 
 	// Verify the args
@@ -126,7 +139,7 @@ func (c *Catalog) Deregister(args *structs.DeregisterRequest, reply *struct{}) e
 	}
 
 	// Fetch the ACL token, if any.
-	rule, err := c.srv.resolveToken(args.Token)
+	rule, err := c.srv.ResolveToken(args.Token)
 	if err != nil {
 		return err
 	}
@@ -168,6 +181,10 @@ func (c *Catalog) ListDatacenters(args *struct{}, reply *[]string) error {
 	dcs, err := c.srv.router.GetDatacentersByDistance()
 	if err != nil {
 		return err
+	}
+
+	if len(dcs) == 0 { // no WAN federation, so return the local data center name
+		dcs = []string{c.srv.config.Datacenter}
 	}
 
 	*reply = dcs
@@ -238,25 +255,56 @@ func (c *Catalog) ServiceNodes(args *structs.ServiceSpecificRequest, reply *stru
 	}
 
 	// Verify the arguments
-	if args.ServiceName == "" {
+	if args.ServiceName == "" && args.ServiceAddress == "" {
 		return fmt.Errorf("Must provide service name")
+	}
+
+	// Determine the function we'll call
+	var f func(memdb.WatchSet, *state.Store) (uint64, structs.ServiceNodes, error)
+	switch {
+	case args.Connect:
+		f = func(ws memdb.WatchSet, s *state.Store) (uint64, structs.ServiceNodes, error) {
+			return s.ConnectServiceNodes(ws, args.ServiceName)
+		}
+
+	default:
+		f = func(ws memdb.WatchSet, s *state.Store) (uint64, structs.ServiceNodes, error) {
+			if args.ServiceAddress != "" {
+				return s.ServiceAddressNodes(ws, args.ServiceAddress)
+			}
+
+			if args.TagFilter {
+				return s.ServiceTagNodes(ws, args.ServiceName, args.ServiceTags)
+			}
+
+			return s.ServiceNodes(ws, args.ServiceName)
+		}
+	}
+
+	// If we're doing a connect query, we need read access to the service
+	// we're trying to find proxies for, so check that.
+	if args.Connect {
+		// Fetch the ACL token, if any.
+		rule, err := c.srv.ResolveToken(args.Token)
+		if err != nil {
+			return err
+		}
+
+		if rule != nil && !rule.ServiceRead(args.ServiceName) {
+			// Just return nil, which will return an empty response (tested)
+			return nil
+		}
 	}
 
 	err := c.srv.blockingQuery(
 		&args.QueryOptions,
 		&reply.QueryMeta,
 		func(ws memdb.WatchSet, state *state.Store) error {
-			var index uint64
-			var services structs.ServiceNodes
-			var err error
-			if args.TagFilter {
-				index, services, err = state.ServiceTagNodes(ws, args.ServiceName, args.ServiceTag)
-			} else {
-				index, services, err = state.ServiceNodes(ws, args.ServiceName)
-			}
+			index, services, err := f(ws, state)
 			if err != nil {
 				return err
 			}
+
 			reply.Index, reply.ServiceNodes = index, services
 			if len(args.NodeMetaFilters) > 0 {
 				var filtered structs.ServiceNodes
@@ -275,23 +323,36 @@ func (c *Catalog) ServiceNodes(args *structs.ServiceSpecificRequest, reply *stru
 
 	// Provide some metrics
 	if err == nil {
-		metrics.IncrCounterWithLabels([]string{"consul", "catalog", "service", "query"}, 1,
-			[]metrics.Label{{Name: "service", Value: args.ServiceName}})
-		metrics.IncrCounterWithLabels([]string{"catalog", "service", "query"}, 1,
+		// For metrics, we separate Connect-based lookups from non-Connect
+		key := "service"
+		if args.Connect {
+			key = "connect"
+		}
+
+		metrics.IncrCounterWithLabels([]string{"catalog", key, "query"}, 1,
 			[]metrics.Label{{Name: "service", Value: args.ServiceName}})
 		if args.ServiceTag != "" {
-			metrics.IncrCounterWithLabels([]string{"consul", "catalog", "service", "query-tag"}, 1,
-				[]metrics.Label{{Name: "service", Value: args.ServiceName}, {Name: "tag", Value: args.ServiceTag}})
-			metrics.IncrCounterWithLabels([]string{"catalog", "service", "query-tag"}, 1,
+			metrics.IncrCounterWithLabels([]string{"catalog", key, "query-tag"}, 1,
 				[]metrics.Label{{Name: "service", Value: args.ServiceName}, {Name: "tag", Value: args.ServiceTag}})
 		}
+		if len(args.ServiceTags) > 0 {
+			// Sort tags so that the metric is the same even if the request
+			// tags are in a different order
+			sort.Strings(args.ServiceTags)
+
+			// Build metric labels
+			labels := []metrics.Label{{Name: "service", Value: args.ServiceName}}
+			for _, tag := range args.ServiceTags {
+				labels = append(labels, metrics.Label{Name: "tag", Value: tag})
+			}
+			metrics.IncrCounterWithLabels([]string{"catalog", key, "query-tags"}, 1, labels)
+		}
 		if len(reply.ServiceNodes) == 0 {
-			metrics.IncrCounterWithLabels([]string{"consul", "catalog", "service", "not-found"}, 1,
-				[]metrics.Label{{Name: "service", Value: args.ServiceName}})
-			metrics.IncrCounterWithLabels([]string{"catalog", "service", "not-found"}, 1,
+			metrics.IncrCounterWithLabels([]string{"catalog", key, "not-found"}, 1,
 				[]metrics.Label{{Name: "service", Value: args.ServiceName}})
 		}
 	}
+
 	return err
 }
 

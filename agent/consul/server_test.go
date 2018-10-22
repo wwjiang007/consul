@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/consul/agent/connect"
 	"github.com/hashicorp/consul/agent/metadata"
+	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/agent/token"
 	"github.com/hashicorp/consul/lib/freeport"
 	"github.com/hashicorp/consul/testrpc"
@@ -91,6 +93,18 @@ func testServerConfig(t *testing.T) (string, *Config) {
 	// looks like several depend on it.
 	config.RPCHoldTimeout = 5 * time.Second
 
+	config.ConnectEnabled = true
+	config.CAConfig = &structs.CAConfiguration{
+		ClusterID: connect.TestClusterID,
+		Provider:  structs.ConsulCAProvider,
+		Config: map[string]interface{}{
+			"PrivateKey":     "",
+			"RootCert":       "",
+			"RotationPeriod": "2160h",
+			"LeafCertTTL":    "72h",
+		},
+	}
+
 	return dir, config
 }
 
@@ -120,6 +134,15 @@ func testServerDCExpect(t *testing.T, dc string, expect int) (string, *Server) {
 		c.Datacenter = dc
 		c.Bootstrap = false
 		c.BootstrapExpect = expect
+	})
+}
+
+func testServerDCExpectNonVoter(t *testing.T, dc string, expect int) (string, *Server) {
+	return testServerWithConfig(t, func(c *Config) {
+		c.Datacenter = dc
+		c.Bootstrap = false
+		c.BootstrapExpect = expect
+		c.NonVoter = true
 	})
 }
 
@@ -565,6 +588,53 @@ func TestServer_Expect(t *testing.T) {
 	}
 }
 
+func TestServer_Expect_NonVoters(t *testing.T) {
+	t.Parallel()
+	dir1, s1 := testServerDCExpectNonVoter(t, "dc1", 2)
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+
+	dir2, s2 := testServerDCExpectNonVoter(t, "dc1", 2)
+	defer os.RemoveAll(dir2)
+	defer s2.Shutdown()
+
+	dir3, s3 := testServerDCExpect(t, "dc1", 2)
+	defer os.RemoveAll(dir3)
+	defer s3.Shutdown()
+
+	dir4, s4 := testServerDCExpect(t, "dc1", 2)
+	defer os.RemoveAll(dir4)
+	defer s4.Shutdown()
+
+	// Join the first three servers.
+	joinLAN(t, s2, s1)
+	joinLAN(t, s3, s1)
+
+	// Should have no peers yet since the bootstrap didn't occur.
+	retry.Run(t, func(r *retry.R) {
+		r.Check(wantPeers(s1, 0))
+		r.Check(wantPeers(s2, 0))
+		r.Check(wantPeers(s3, 0))
+	})
+
+	// Join the fourth node.
+	joinLAN(t, s4, s1)
+
+	// Now we have three servers so we should bootstrap.
+	retry.Run(t, func(r *retry.R) {
+		r.Check(wantPeers(s1, 4))
+		r.Check(wantPeers(s2, 4))
+		r.Check(wantPeers(s3, 4))
+		r.Check(wantPeers(s4, 4))
+	})
+
+	// Make sure a leader is elected
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+	retry.Run(t, func(r *retry.R) {
+		r.Check(wantRaft([]*Server{s1, s2, s3, s4}))
+	})
+}
+
 func TestServer_BadExpect(t *testing.T) {
 	t.Parallel()
 	// this one is in expect=3 mode
@@ -629,7 +699,7 @@ func TestServer_globalRPCErrors(t *testing.T) {
 		t.Fatalf("should have errored")
 	}
 	if !strings.Contains(err.Error(), "Bad.Method") {
-		t.Fatalf("unexpcted error: %s", err)
+		t.Fatalf("unexpected error: %s", err)
 	}
 }
 
@@ -759,5 +829,23 @@ func TestServer_TLSToFullVerify(t *testing.T) {
 	}
 	if !success {
 		t.Fatalf("bad: %v", success)
+	}
+}
+
+func TestServer_RevokeLeadershipIdempotent(t *testing.T) {
+	t.Parallel()
+	dir1, s1 := testServer(t)
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+
+	err := s1.revokeLeadership()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s1.revokeLeadership()
+	if err != nil {
+		t.Fatal(err)
 	}
 }

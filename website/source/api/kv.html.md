@@ -34,12 +34,13 @@ For multi-key reads, please consider using [transaction](/api/txn.html).
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required |
-| ---------------- | ----------------- | ------------ |
-| `YES`            | `all`             | `key:read`   |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required |
+| ---------------- | ----------------- | ------------- | ------------ |
+| `YES`            | `all`             | `none`        | `key:read`   |
 
 ### Parameters
 
@@ -69,7 +70,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-    https://consul.rocks/v1/kv/my-key
+    http://127.0.0.1:8500/v1/kv/my-key
 ```
 
 ### Sample Response
@@ -154,12 +155,13 @@ Even though the return type is `application/json`, the value is either `true` or
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required |
-| ---------------- | ----------------- | ------------ |
-| `NO`             | `none`            | `key:write`  |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required |
+| ---------------- | ----------------- | ------------- | ------------ |
+| `NO`             | `none`            | `none`        | `key:write`  |
 
 ### Parameters
 
@@ -186,7 +188,12 @@ The table below shows this endpoint's support for
   A key does not need to exist to be acquired. If the lock is already held by
   the given session, then the `LockIndex` is not incremented but the key
   contents are updated. This lets the current lock holder update the key
-  contents without having to give up the lock and reacquire it.
+  contents without having to give up the lock and reacquire it. **Note that an update
+  that does not include the acquire parameter will proceed normally even if another
+  session has locked the key.**
+
+    For an example of how to use the lock feature, see the [Leader Election Guide]
+    (/docs/guides/leader-election.html).
 
 - `release` `(string: "")` - Specifies to use a lock release operation. This is
   useful when paired with `?acquire=` as it allows clients to yield a lock. This
@@ -197,13 +204,20 @@ The table below shows this endpoint's support for
 
 The payload is arbitrary, and is loaded directly into Consul as supplied.
 
-### Sample Request
+### Sample Requests
 
-```text
+```bash
 $ curl \
     --request PUT \
     --data @contents \
-    https://consul.rocks/v1/kv/my-key
+    http://127.0.0.1:8500/v1/kv/my-key
+
+# or
+
+$ curl \
+    --request PUT \
+    --data-binary @contents \
+    http://127.0.0.1:8500/v1/kv/my-key
 ```
 
 ### Sample Response
@@ -222,12 +236,13 @@ This endpoint deletes a single key or all keys sharing a prefix.
 
 The table below shows this endpoint's support for
 [blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes), and
+[consistency modes](/api/index.html#consistency-modes),
+[agent caching](/api/index.html#agent-caching), and
 [required ACLs](/api/index.html#acls).
 
-| Blocking Queries | Consistency Modes | ACL Required |
-| ---------------- | ----------------- | ------------ |
-| `NO`             | `none`            | `key:write`  |
+| Blocking Queries | Consistency Modes | Agent Caching | ACL Required |
+| ---------------- | ----------------- | ------------- | ------------ |
+| `NO`             | `none`            | `none`        | `key:write`  |
 
 ### Parameters
 
@@ -246,7 +261,7 @@ The table below shows this endpoint's support for
 ```text
 $ curl \
     --request DELETE \
-    https://consul.rocks/v1/kv/my-key
+    http://127.0.0.1:8500/v1/kv/my-key
 ```
 
 ### Sample Response

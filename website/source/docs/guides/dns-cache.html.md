@@ -24,30 +24,30 @@ customize how DNS queries are handled.
 ## Stale Reads
 
 Stale reads can be used to reduce latency and increase the throughput
-of DNS queries. By default, all reads are serviced by a
-[single leader node](/docs/internals/consensus.html).
-These reads are strongly consistent but are limited by the throughput
-of a single node. Doing a stale read allows any Consul server to
+of DNS queries. The [settings](/docs/agent/options.html) used to control stale reads
+are [`dns_config.allow_stale`](/docs/agent/options.html#allow_stale),
+which must be set to enable stale reads, and [`dns_config.max_stale`](/docs/agent/options.html#max_stale)
+which limits how stale results are allowed to be.
+
+Since Consul 0.7.1, [`allow_stale`](/docs/agent/options.html#allow_stale)
+is enabled by default, using a [`max_stale`](/docs/agent/options.html#max_stale)
+value that defaults to a near-indefinite threshold (10 years) to allow DNS queries to continue to be served in the event
+of a long outage with no leader. A new telemetry counter has also been added at
+`consul.dns.stale_queries` to track when agents serve DNS queries that are stale
+by more than 5 seconds.
+
+Doing a stale read allows any Consul server to
 service a query, but non-leader nodes may return data that is
 out-of-date. By allowing data to be slightly stale, we get horizontal
 read scalability. Now any Consul server can service the request, so we
 increase throughput by the number of servers in a cluster.
 
-The [settings](/docs/agent/options.html) used to control stale reads
-are [`dns_config.allow_stale`](/docs/agent/options.html#allow_stale),
-which must be set to enable stale reads, and
-[`dns_config.max_stale`](/docs/agent/options.html#max_stale)
-which limits how stale results are allowed to be.
-
-Starting from Consul 0.7, [`allow_stale`](/docs/agent/options.html#allow_stale)
-is enabled by default, using a [`max_stale`](/docs/agent/options.html#max_stale)
-value that defaults to 5 seconds, meaning that we will use data from
-any Consul server that is within 5 seconds of the leader. In Consul 0.7.1, the
-default for `max_stale` was been increased from 5 seconds to a near-indefinite
-threshold (10 years) to allow DNS queries to continue to be served in the event
-of a long outage with no leader. A new telemetry counter has also been added at
-`consul.dns.stale_queries` to track when agents serve DNS queries that are stale
-by more than 5 seconds.
+If you want to prevent
+stale reads or limit how stale they can be, you can set `allow_stale`
+to false or use a lower value for `max_stale`. Doing the first will ensure that
+all reads are serviced by a [single leader node](/docs/internals/consensus.html).
+The reads will then be strongly consistent but will be limited by the throughput
+of a single node. 
 
 ## Negative Response Caching
 
@@ -65,6 +65,11 @@ client and Consul and set the cache values appropriately. In many cases
 "appropriately" simply is turning negative response caching off to get the best
 recovery time when a service becomes available again.
 
+With versions of Consul greater than 1.3.0, it is now possible to tune SOA
+responses and modify the negative TTL cache for some resolvers. It can
+be achieved using the [`soa.min_ttl`](/docs/agent/options.html#soa_min_ttl)
+configuration within the [`soa`](/docs/agent/options.html#soa) configuration.
+
 <a name="ttl"></a>
 ## TTL Values
 
@@ -80,7 +85,11 @@ To enable caching of node lookups (e.g. "foo.node.consul"), we can set the
 Service TTLs can be specified in a more granular fashion. You can set TTLs
 per-service, with a wildcard TTL as the default. This is specified using the
 [`dns_config.service_ttl`](/docs/agent/options.html#service_ttl) map. The "*"
-service is the wildcard service.
+is supported at the end of any prefix and a lower precedence than strict match,
+so 'my-service-x' has precedence over 'my-service-*', when performing wildcard
+match, the longest path is taken into account, thus 'my-service-*' TTL will
+be used instead of 'my-*' or '*'. With the same rule, '*' is the default value
+when nothing else matches. If no match is found the TTL defaults to 0.
 
 For example, a [`dns_config`](/docs/agent/options.html#dns_config) that provides
 a wildcard TTL and a specific TTL for a service might look like this:
@@ -90,7 +99,9 @@ a wildcard TTL and a specific TTL for a service might look like this:
   "dns_config": {
     "service_ttl": {
       "*": "5s",
-      "web": "30s"
+      "web": "30s",
+      "db*": "10s",
+      "db-master": "3s"
     }
   }
 }
@@ -99,6 +110,9 @@ a wildcard TTL and a specific TTL for a service might look like this:
 This sets all lookups to "web.service.consul" to use a 30 second TTL
 while lookups to "db.service.consul" or "api.service.consul" will use the
 5 second TTL from the wildcard.
+
+All lookups matching "db*" would get a 10 seconds TTL except "db-master"
+that would have a 3 seconds TTL.
 
 [Prepared Queries](/api/query.html) provide an additional
 level of control over TTL. They allow for the TTL to be defined along with

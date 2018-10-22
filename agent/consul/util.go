@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/hashicorp/consul/agent/metadata"
+	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/serf/serf"
 )
@@ -75,51 +76,22 @@ func CanServersUnderstandProtocol(members []serf.Member, version uint8) (bool, e
 		}
 		numServers++
 
-		vsn_min, err := strconv.Atoi(m.Tags["vsn_min"])
+		vsnMin, err := strconv.Atoi(m.Tags["vsn_min"])
 		if err != nil {
 			return false, err
 		}
 
-		vsn_max, err := strconv.Atoi(m.Tags["vsn_max"])
+		vsnMax, err := strconv.Atoi(m.Tags["vsn_max"])
 		if err != nil {
 			return false, err
 		}
 
 		v := int(version)
-		if (v >= vsn_min) && (v <= vsn_max) {
+		if (v >= vsnMin) && (v <= vsnMax) {
 			numWhoGrok++
 		}
 	}
 	return (numServers > 0) && (numWhoGrok == numServers), nil
-}
-
-// ServerMinRaftProtocol returns the lowest supported Raft protocol among alive servers
-func ServerMinRaftProtocol(members []serf.Member) (int, error) {
-	minVersion := -1
-	for _, m := range members {
-		if m.Tags["role"] != "consul" || m.Status != serf.StatusAlive {
-			continue
-		}
-
-		vsn, ok := m.Tags["raft_vsn"]
-		if !ok {
-			vsn = "1"
-		}
-		raftVsn, err := strconv.Atoi(vsn)
-		if err != nil {
-			return -1, err
-		}
-
-		if minVersion == -1 || raftVsn < minVersion {
-			minVersion = raftVsn
-		}
-	}
-
-	if minVersion == -1 {
-		return minVersion, fmt.Errorf("No servers found")
-	}
-
-	return minVersion, nil
 }
 
 // Returns if a member is a consul node. Returns a bool,
@@ -132,8 +104,8 @@ func isConsulNode(m serf.Member) (bool, string) {
 }
 
 // Returns if the given IP is in a private block
-func isPrivateIP(ip_str string) bool {
-	ip := net.ParseIP(ip_str)
+func isPrivateIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
 	for _, priv := range privateBlocks {
 		if priv.Contains(ip) {
 			return true
@@ -310,4 +282,39 @@ func ServersMeetMinimumVersion(members []serf.Member, minVersion *version.Versio
 	}
 
 	return true
+}
+
+func ServersGetACLMode(members []serf.Member, leader string, datacenter string) (mode structs.ACLMode, leaderMode structs.ACLMode) {
+	mode = structs.ACLModeEnabled
+	leaderMode = structs.ACLModeDisabled
+	for _, member := range members {
+		if valid, parts := metadata.IsConsulServer(member); valid {
+
+			if datacenter != "" && parts.Datacenter != datacenter {
+				continue
+			}
+			if memberAddr := (&net.TCPAddr{IP: member.Addr, Port: parts.Port}).String(); memberAddr == leader {
+				leaderMode = parts.ACLs
+			}
+
+			switch parts.ACLs {
+			case structs.ACLModeDisabled:
+				// anything disabled means we cant enable ACLs
+				mode = structs.ACLModeDisabled
+			case structs.ACLModeEnabled:
+				// do nothing
+			case structs.ACLModeLegacy:
+				// This covers legacy mode and older server versions that don't advertise ACL support
+				if mode != structs.ACLModeDisabled && mode != structs.ACLModeUnknown {
+					mode = structs.ACLModeLegacy
+				}
+			default:
+				if mode != structs.ACLModeDisabled {
+					mode = structs.ACLModeUnknown
+				}
+			}
+		}
+	}
+
+	return
 }

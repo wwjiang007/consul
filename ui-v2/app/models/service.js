@@ -13,10 +13,13 @@ export default Model.extend({
       return [];
     },
   }),
+  InstanceCount: attr('number'),
+  ProxyFor: attr(),
   Kind: attr('string'),
   ExternalSources: attr(),
   Meta: attr(),
   Address: attr('string'),
+  TaggedAddresses: attr(),
   Port: attr('number'),
   EnableTagOverride: attr('boolean'),
   CreateIndex: attr('number'),
@@ -27,9 +30,12 @@ export default Model.extend({
   ChecksWarning: attr(),
   Nodes: attr(),
   Datacenter: attr('string'),
+  Namespace: attr('string'),
   Node: attr(),
   Service: attr(),
   Checks: attr(),
+  SyncTime: attr('number'),
+  meta: attr(),
   passing: computed('ChecksPassing', 'Checks', function() {
     let num = 0;
     // TODO: use typeof

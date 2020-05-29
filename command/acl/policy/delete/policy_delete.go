@@ -34,6 +34,7 @@ func (c *cmd) init() {
 	c.http = &flags.HTTPFlags{}
 	flags.Merge(c.flags, c.http.ClientFlags())
 	flags.Merge(c.flags, c.http.ServerFlags())
+	flags.Merge(c.flags, c.http.NamespaceFlags())
 	c.help = flags.Usage(help, c.flags)
 }
 
@@ -81,18 +82,18 @@ func (c *cmd) Help() string {
 	return flags.Usage(c.help, nil)
 }
 
-const synopsis = "Delete an ACL Policy"
+const synopsis = "Delete an ACL policy"
 const help = `
 Usage: consul acl policy delete [options] -id POLICY
 
     Deletes an ACL policy by providing either the ID or a unique ID prefix.
 
-      Delete by prefix:
+    Delete by prefix:
 
-          $ consul acl policy delete -id b6b85
+        $ consul acl policy delete -id b6b85
 
-      Delete by full ID:
+    Delete by full ID:
 
-          $ consul acl policy delete -id b6b856da-5193-4e78-845a-7d61ca8371ba
+        $ consul acl policy delete -id b6b856da-5193-4e78-845a-7d61ca8371ba
 
 `

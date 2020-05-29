@@ -1,34 +1,21 @@
 import Controller from '@ember/controller';
 import { get } from '@ember/object';
-import { computed } from '@ember/object';
-import sumOfUnhealthy from 'consul-ui/utils/sumOfUnhealthy';
-import hasStatus from 'consul-ui/utils/hasStatus';
-import WithHealthFiltering from 'consul-ui/mixins/with-health-filtering';
-export default Controller.extend(WithHealthFiltering, {
-  init: function() {
-    this._super(...arguments);
-  },
-  unhealthy: computed('filtered', function() {
-    return get(this, 'filtered').filter(function(item) {
-      return sumOfUnhealthy(item.Checks) > 0;
-    });
+import { inject as service } from '@ember/service';
+import WithEventSource, { listen } from 'consul-ui/mixins/with-event-source';
+export default Controller.extend(WithEventSource, {
+  dom: service('dom'),
+  notify: service('flashMessages'),
+  item: listen('item').catch(function(e) {
+    if (e.target.readyState === 1) {
+      // OPEN
+      if (get(e, 'error.errors.firstObject.status') === '404') {
+        this.notify.add({
+          destroyOnClick: false,
+          sticky: true,
+          type: 'warning',
+          action: 'update',
+        });
+      }
+    }
   }),
-  healthy: computed('filtered', function() {
-    return get(this, 'filtered').filter(function(item) {
-      return sumOfUnhealthy(item.Checks) === 0;
-    });
-  }),
-  filter: function(item, { s = '', status = '' }) {
-    const term = s.toLowerCase();
-
-    return (
-      get(item, 'Node.Node')
-        .toLowerCase()
-        .indexOf(term) !== -1 ||
-      (get(item, 'Service.ID')
-        .toLowerCase()
-        .indexOf(term) !== -1 &&
-        hasStatus(get(item, 'Checks'), status))
-    );
-  },
 });

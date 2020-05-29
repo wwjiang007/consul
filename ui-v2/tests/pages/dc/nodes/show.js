@@ -1,7 +1,13 @@
-export default function(visitable, deletable, clickable, attribute, collection, radiogroup) {
+export default function(visitable, deletable, clickable, attribute, collection, tabs) {
   return {
     visit: visitable('/:dc/nodes/:node'),
-    tabs: radiogroup('tab', ['health-checks', 'services', 'round-trip-time', 'lock-sessions']),
+    tabs: tabs('tab', [
+      'health-checks',
+      'services',
+      'round-trip-time',
+      'lock-sessions',
+      'metadata',
+    ]),
     healthchecks: collection('[data-test-node-healthcheck]', {
       name: attribute('data-test-node-healthcheck'),
     }),
@@ -17,5 +23,6 @@ export default function(visitable, deletable, clickable, attribute, collection, 
         TTL: attribute('data-test-session-ttl', '[data-test-session-ttl]'),
       })
     ),
+    metadata: collection('#metadata [data-test-tabular-row]', {}),
   };
 }

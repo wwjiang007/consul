@@ -8,9 +8,8 @@ import (
 
 	"github.com/hashicorp/consul/agent"
 	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/consul/logger"
+	"github.com/hashicorp/consul/sdk/testutil"
 	"github.com/hashicorp/consul/testrpc"
-	"github.com/hashicorp/consul/testutil"
 	"github.com/mitchellh/cli"
 	"github.com/stretchr/testify/assert"
 )
@@ -30,7 +29,7 @@ func TestPolicyDeleteCommand(t *testing.T) {
 	testDir := testutil.TempDir(t, "acl")
 	defer os.RemoveAll(testDir)
 
-	a := agent.NewTestAgent(t.Name(), `
+	a := agent.NewTestAgent(t, `
 	primary_datacenter = "dc1"
 	acl {
 		enabled = true
@@ -38,8 +37,6 @@ func TestPolicyDeleteCommand(t *testing.T) {
 			master = "root"
 		}
 	}`)
-
-	a.Agent.LogWriter = logger.NewLogWriter(512)
 
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")

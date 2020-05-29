@@ -23,7 +23,7 @@ func (c *cmd) Help() string {
 	return flags.Usage(help, nil)
 }
 
-const synopsis = "Interact with the Consul's ACLs"
+const synopsis = "Interact with Consul's ACLs"
 const help = `
 Usage: consul acl <subcommand> [options] [args]
 
@@ -35,16 +35,16 @@ Usage: consul acl <subcommand> [options] [args]
 
       $ consul acl bootstrap
 
-  List all ACL Tokens:
+  List all ACL tokens:
 
-      $ consul acl tokens list
+      $ consul acl token list
 
-  Create a new ACL Policy:
+  Create a new ACL policy:
 
-      $ consul acl policy create “new-policy” \
-                                 -description “This is an example policy” \
-                                 -datacenter “dc1” \
-                                 -datacenter “dc2” \
+      $ consul acl policy create -name "new-policy" \
+                                 -description "This is an example policy" \
+                                 -datacenter "dc1" \
+                                 -datacenter "dc2" \
                                  -rules @rules.hcl
 
   Set the default agent token:

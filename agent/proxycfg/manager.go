@@ -2,12 +2,13 @@ package proxycfg
 
 import (
 	"errors"
-	"log"
 	"sync"
 
 	"github.com/hashicorp/consul/agent/cache"
 	"github.com/hashicorp/consul/agent/local"
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/tlsutil"
+	"github.com/hashicorp/go-hclog"
 )
 
 var (
@@ -45,8 +46,8 @@ type Manager struct {
 
 	mu       sync.Mutex
 	started  bool
-	proxies  map[string]*state
-	watchers map[string]map[uint64]chan *ConfigSnapshot
+	proxies  map[structs.ServiceID]*state
+	watchers map[structs.ServiceID]map[uint64]chan *ConfigSnapshot
 }
 
 // ManagerConfig holds the required external dependencies for a Manager
@@ -64,8 +65,11 @@ type ManagerConfig struct {
 	// Datacenter name into other request types that need it. This is sufficient
 	// for now and cleaner than passing the entire RuntimeConfig.
 	Source *structs.QuerySource
+	// DNSConfig is the agent's relevant DNS config for any proxies.
+	DNSConfig DNSConfig
 	// logger is the agent's logger to be used for logging logs.
-	Logger *log.Logger
+	Logger          hclog.Logger
+	TLSConfigurator *tlsutil.Configurator
 }
 
 // NewManager constructs a manager from the provided agent cache.
@@ -79,8 +83,8 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		// Single item buffer is enough since there is no data transferred so this
 		// is "level triggering" and we can't miss actual data.
 		stateCh:  make(chan struct{}, 1),
-		proxies:  make(map[string]*state),
-		watchers: make(map[string]map[uint64]chan *ConfigSnapshot),
+		proxies:  make(map[structs.ServiceID]*state),
+		watchers: make(map[structs.ServiceID]map[uint64]chan *ConfigSnapshot),
 	}
 	return m, nil
 }
@@ -129,9 +133,12 @@ func (m *Manager) syncState() {
 	defer m.mu.Unlock()
 
 	// Traverse the local state and ensure all proxy services are registered
-	services := m.State.Services()
-	for svcID, svc := range services {
-		if svc.Kind != structs.ServiceKindConnectProxy {
+	services := m.State.Services(structs.WildcardEnterpriseMeta())
+	for sid, svc := range services {
+		if svc.Kind != structs.ServiceKindConnectProxy &&
+			svc.Kind != structs.ServiceKindTerminatingGateway &&
+			svc.Kind != structs.ServiceKindMeshGateway &&
+			svc.Kind != structs.ServiceKindIngressGateway {
 			continue
 		}
 		// TODO(banks): need to work out when to default some stuff. For example
@@ -139,13 +146,14 @@ func (m *Manager) syncState() {
 		// default to the port of the sidecar service, but only if it's already
 		// registered and once we get past here, we don't have enough context to
 		// know that so we'd need to set it here if not during registration of the
-		// proxy service. Sidecar Service and managed proxies in the interim can
-		// do that, but we should validate more generally that that is always
-		// true.
-		err := m.ensureProxyServiceLocked(svc, m.State.ServiceToken(svcID))
+		// proxy service. Sidecar Service in the interim can do that, but we should
+		// validate more generally that that is always true.
+		err := m.ensureProxyServiceLocked(svc, m.State.ServiceToken(sid))
 		if err != nil {
-			m.Logger.Printf("[ERR] failed to watch proxy service %s: %s", svc.ID,
-				err)
+			m.Logger.Error("failed to watch proxy service",
+				"service", sid.String(),
+				"error", err,
+			)
 		}
 	}
 
@@ -160,7 +168,8 @@ func (m *Manager) syncState() {
 
 // ensureProxyServiceLocked adds or changes the proxy to our state.
 func (m *Manager) ensureProxyServiceLocked(ns *structs.NodeService, token string) error {
-	state, ok := m.proxies[ns.ID]
+	sid := ns.CompoundServiceID()
+	state, ok := m.proxies[sid]
 
 	if ok {
 		if !state.Changed(ns, token) {
@@ -168,7 +177,7 @@ func (m *Manager) ensureProxyServiceLocked(ns *structs.NodeService, token string
 			return nil
 		}
 
-		// We are updating the proxy, close it's old state
+		// We are updating the proxy, close its old state
 		state.Close()
 	}
 
@@ -179,15 +188,19 @@ func (m *Manager) ensureProxyServiceLocked(ns *structs.NodeService, token string
 	}
 
 	// Set the necessary dependencies
-	state.logger = m.Logger
+	state.logger = m.Logger.With("service_id", sid.String())
 	state.cache = m.Cache
 	state.source = m.Source
+	state.dnsConfig = m.DNSConfig
+	if m.TLSConfigurator != nil {
+		state.serverSNIFn = m.TLSConfigurator.ServerSNI
+	}
 
 	ch, err := state.Watch()
 	if err != nil {
 		return err
 	}
-	m.proxies[ns.ID] = state
+	m.proxies[sid] = state
 
 	// Start a goroutine that will wait for changes and broadcast them to watchers.
 	go func(ch <-chan ConfigSnapshot) {
@@ -202,7 +215,7 @@ func (m *Manager) ensureProxyServiceLocked(ns *structs.NodeService, token string
 
 // removeProxyService is called when a service deregisters and frees all
 // resources for that service.
-func (m *Manager) removeProxyServiceLocked(proxyID string) {
+func (m *Manager) removeProxyServiceLocked(proxyID structs.ServiceID) {
 	state, ok := m.proxies[proxyID]
 	if !ok {
 		return
@@ -265,8 +278,9 @@ OUTER:
 	default:
 		// This should not be possible since we should be the only sender, enforced
 		// by m.mu but error and drop the update rather than panic.
-		m.Logger.Printf("[ERR] proxycfg: failed to deliver ConfigSnapshot to %q",
-			snap.ProxyID)
+		m.Logger.Error("failed to deliver ConfigSnapshot to proxy",
+			"proxy", snap.ProxyID.String(),
+		)
 	}
 }
 
@@ -274,7 +288,7 @@ OUTER:
 // will not fail, but no updates will be delivered until the proxy is
 // registered. If there is already a valid snapshot in memory, it will be
 // delivered immediately.
-func (m *Manager) Watch(proxyID string) (<-chan *ConfigSnapshot, CancelFunc) {
+func (m *Manager) Watch(proxyID structs.ServiceID) (<-chan *ConfigSnapshot, CancelFunc) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -308,7 +322,7 @@ func (m *Manager) Watch(proxyID string) (<-chan *ConfigSnapshot, CancelFunc) {
 
 // closeWatchLocked cleans up state related to a single watcher. It assumes the
 // lock is held.
-func (m *Manager) closeWatchLocked(proxyID string, watchIdx uint64) {
+func (m *Manager) closeWatchLocked(proxyID structs.ServiceID, watchIdx uint64) {
 	if watchers, ok := m.watchers[proxyID]; ok {
 		if ch, ok := watchers[watchIdx]; ok {
 			delete(watchers, watchIdx)

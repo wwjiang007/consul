@@ -1,58 +1,29 @@
 import Controller from '@ember/controller';
-import { get, set } from '@ember/object';
-import { getOwner } from '@ember/application';
-import WithFiltering from 'consul-ui/mixins/with-filtering';
-import qsaFactory from 'consul-ui/utils/dom/qsa-factory';
-import getComponentFactory from 'consul-ui/utils/get-component-factory';
+import { inject as service } from '@ember/service';
+import { get } from '@ember/object';
+import { alias } from '@ember/object/computed';
+import WithEventSource, { listen } from 'consul-ui/mixins/with-event-source';
 
-const $$ = qsaFactory();
-export default Controller.extend(WithFiltering, {
-  queryParams: {
-    s: {
-      as: 'filter',
-      replace: true,
-    },
-  },
-  setProperties: function() {
-    this._super(...arguments);
-    // the default selected tab depends on whether you have any healthchecks or not
-    // so check the length here.
-    // This method is called immediately after `Route::setupController`, and done here rather than there
-    // as this is a variable used purely for view level things, if the view was different we might not
-    // need this variable
-    set(this, 'selectedTab', get(this.item, 'Checks.length') > 0 ? 'health-checks' : 'services');
-  },
-  filter: function(item, { s = '' }) {
-    const term = s.toLowerCase();
-    return (
-      get(item, 'Service')
-        .toLowerCase()
-        .indexOf(term) !== -1 ||
-      get(item, 'ID')
-        .toLowerCase()
-        .indexOf(term) !== -1 ||
-      (get(item, 'Tags') || []).some(function(item) {
-        return item.toLowerCase().indexOf(term) !== -1;
-      }) ||
-      get(item, 'Port')
-        .toString()
-        .toLowerCase()
-        .indexOf(term) !== -1
-    );
-  },
+export default Controller.extend(WithEventSource, {
+  dom: service('dom'),
+  notify: service('flashMessages'),
+  items: alias('item.Services'),
+  item: listen('item').catch(function(e) {
+    if (e.target.readyState === 1) {
+      // OPEN
+      if (get(e, 'error.errors.firstObject.status') === '404') {
+        this.notify.add({
+          destroyOnClick: false,
+          sticky: true,
+          type: 'warning',
+          action: 'update',
+        });
+        this.tomography.close();
+        this.sessions.close();
+      }
+    }
+  }),
   actions: {
-    change: function(e) {
-      set(this, 'selectedTab', e.target.value);
-      const getComponent = getComponentFactory(getOwner(this));
-      // Ensure tabular-collections sizing is recalculated
-      // now it is visible in the DOM
-      [...$$('.tab-section input[type="radio"]:checked + div table')].forEach(function(item) {
-        const component = getComponent(item);
-        if (component && typeof component.didAppear === 'function') {
-          getComponent(item).didAppear();
-        }
-      });
-    },
     sortChecksByImportance: function(a, b) {
       const statusA = get(a, 'Status');
       const statusB = get(b, 'Status');

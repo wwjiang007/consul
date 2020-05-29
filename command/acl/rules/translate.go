@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/hashicorp/consul/acl"
 	aclhelpers "github.com/hashicorp/consul/command/acl"
@@ -33,6 +34,10 @@ type cmd struct {
 
 func (c *cmd) init() {
 	c.flags = flag.NewFlagSet("", flag.ContinueOnError)
+	c.flags.BoolVar(&c.tokenAccessor, "token-accessor", false, "Specifies that "+
+		"the TRANSLATE argument refers to a ACL token AccessorID. "+
+		"The rules to translate will then be read from the retrieved token")
+
 	c.flags.BoolVar(&c.tokenSecret, "token-secret", false,
 		"Specifies that the TRANSLATE argument refers to a ACL token SecretID. "+
 			"The rules to translate will then be read from the retrieved token")
@@ -48,19 +53,29 @@ func (c *cmd) Run(args []string) int {
 		return 1
 	}
 
+	if c.tokenSecret && c.tokenAccessor {
+		c.UI.Error(fmt.Sprintf("Error - cannot specify both -token-secret and -token-accessor"))
+		return 1
+	}
+
 	data, err := c.dataFromArgs(c.flags.Args())
 	if err != nil {
 		c.UI.Error(fmt.Sprintf("Error! %v", err))
 		return 1
 	}
 
-	if c.tokenSecret {
+	if c.tokenSecret || c.tokenAccessor {
 		client, err := c.http.APIClient()
 		if err != nil {
 			c.UI.Error(fmt.Sprintf("Error connecting to Consul Agent: %s", err))
 			return 1
 		}
 
+		// Trim whitespace and newlines (e.g. from echo without -n)
+		data = strings.TrimSpace(data)
+
+		// It is not a bug that this doesn't look at tokenAccessor. We already know that we want the rules from
+		// a token and just need to tell the helper function whether it should be retrieved by its secret or accessor
 		if rules, err := aclhelpers.GetRulesFromLegacyToken(client, data, c.tokenSecret); err != nil {
 			c.UI.Error(err.Error())
 			return 1
@@ -123,9 +138,9 @@ Usage: consul acl translate-rules  [options] TRANSLATE
 
   Translate rules for a legacy ACL token using its SecretID passed from stdin:
 
-      $ consul acl translate-rules --token-secret -
+      $ consul acl translate-rules -token-secret -
 
   Translate rules for a legacy ACL token using its AccessorID:
 
-      $ consul acl translate-rules 429cd746-03d5-4bbb-a83a-18b164171c89
+      $ consul acl translate-rules -token-accessor 429cd746-03d5-4bbb-a83a-18b164171c89
 `

@@ -4,13 +4,15 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/hashicorp/consul/agent/checks"
 	"github.com/hashicorp/consul/agent/consul"
 	"github.com/hashicorp/consul/version"
+	"github.com/hashicorp/raft"
 )
 
 func DefaultRPCProtocol() (int, error) {
 	src := DefaultSource()
-	c, err := Parse(src.Data, src.Format)
+	c, _, err := Parse(src.Data, src.Format)
 	if err != nil {
 		return 0, fmt.Errorf("Error parsing default config: %s", err)
 	}
@@ -49,9 +51,11 @@ func DefaultSource() Source {
 		bind_addr = "0.0.0.0"
 		bootstrap = false
 		bootstrap_expect = 0
+		check_output_max_size = ` + strconv.Itoa(checks.DefaultBufSize) + `
 		check_update_interval = "5m"
 		client_addr = "127.0.0.1"
 		datacenter = "` + consul.DefaultDC + `"
+		default_query_time = "300s"
 		disable_coordinates = false
 		disable_host_node_id = true
 		disable_remote_exec = true
@@ -59,12 +63,14 @@ func DefaultSource() Source {
 		encrypt_verify_incoming = true
 		encrypt_verify_outgoing = true
 		log_level = "INFO"
+		max_query_time = "600s"
+		primary_gateways_interval = "30s"
 		protocol =  2
 		retry_interval = "30s"
 		retry_interval_wan = "30s"
 		server = false
 		syslog_facility = "LOCAL0"
-		tls_min_version = "tls10"
+		tls_min_version = "tls12"
 
 		// TODO (slackpad) - Until #3744 is done, we need to keep these
 		// in sync with agent/consul/config.go.
@@ -98,8 +104,14 @@ func DefaultSource() Source {
 			recursor_timeout = "2s"
 		}
 		limits = {
+			http_max_conns_per_client = 200
+			https_handshake_timeout = "5s"
+			rpc_handshake_timeout = "5s"
 			rpc_rate = -1
 			rpc_max_burst = 1000
+			rpc_max_conns_per_client = 100
+			kv_max_value_size = ` + strconv.FormatInt(raft.SuggestedMaxDataSize, 10) + `
+			txn_max_req_len = ` + strconv.FormatInt(raft.SuggestedMaxDataSize, 10) + `
 		}
 		performance = {
 			leave_drain_time = "5s"
@@ -118,6 +130,8 @@ func DefaultSource() Source {
 			proxy_max_port = 20255
 			sidecar_min_port = 21000
 			sidecar_max_port = 21255
+			expose_min_port = 21500
+			expose_max_port = 21755
 		}
 		telemetry = {
 			metrics_prefix = "consul"

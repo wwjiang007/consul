@@ -51,13 +51,13 @@ func (c *cmd) Run(args []string) int {
 
 	switch tokenType {
 	case "default":
-		_, err = client.Agent().UpdateACLToken(token, nil)
+		_, err = client.Agent().UpdateDefaultACLToken(token, nil)
 	case "agent":
-		_, err = client.Agent().UpdateACLAgentToken(token, nil)
+		_, err = client.Agent().UpdateAgentACLToken(token, nil)
 	case "master":
-		_, err = client.Agent().UpdateACLAgentMasterToken(token, nil)
+		_, err = client.Agent().UpdateAgentMasterACLToken(token, nil)
 	case "replication":
-		_, err = client.Agent().UpdateACLReplicationToken(token, nil)
+		_, err = client.Agent().UpdateReplicationACLToken(token, nil)
 	default:
 		c.UI.Error(fmt.Sprintf("Unknown token type"))
 		return 1
@@ -103,7 +103,7 @@ func (c *cmd) Help() string {
 	return flags.Usage(c.help, nil)
 }
 
-const synopsis = "Interact with the Consul's ACLs"
+const synopsis = "Assign tokens for the Consul Agent's usage"
 const help = `
 Usage: consul acl set-agent-token [options] TYPE TOKEN
 

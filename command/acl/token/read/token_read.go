@@ -3,8 +3,11 @@ package tokenread
 import (
 	"flag"
 	"fmt"
+	"strings"
 
+	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/command/acl"
+	"github.com/hashicorp/consul/command/acl/token"
 	"github.com/hashicorp/consul/command/flags"
 	"github.com/mitchellh/cli"
 )
@@ -21,17 +24,31 @@ type cmd struct {
 	http  *flags.HTTPFlags
 	help  string
 
-	tokenID string
+	tokenID  string
+	self     bool
+	showMeta bool
+	format   string
 }
 
 func (c *cmd) init() {
 	c.flags = flag.NewFlagSet("", flag.ContinueOnError)
+	c.flags.BoolVar(&c.showMeta, "meta", false, "Indicates that token metadata such "+
+		"as the content hash and Raft indices should be shown for each entry")
+	c.flags.BoolVar(&c.self, "self", false, "Indicates that the current HTTP token "+
+		"should be read by secret ID instead of expecting a -id option")
 	c.flags.StringVar(&c.tokenID, "id", "", "The Accessor ID of the token to read. "+
 		"It may be specified as a unique ID prefix but will error if the prefix "+
 		"matches multiple token Accessor IDs")
+	c.flags.StringVar(
+		&c.format,
+		"format",
+		token.PrettyFormat,
+		fmt.Sprintf("Output format {%s}", strings.Join(token.GetSupportedFormats(), "|")),
+	)
 	c.http = &flags.HTTPFlags{}
 	flags.Merge(c.flags, c.http.ClientFlags())
 	flags.Merge(c.flags, c.http.ServerFlags())
+	flags.Merge(c.flags, c.http.NamespaceFlags())
 	c.help = flags.Usage(help, c.flags)
 }
 
@@ -40,7 +57,7 @@ func (c *cmd) Run(args []string) int {
 		return 1
 	}
 
-	if c.tokenID == "" {
+	if c.tokenID == "" && !c.self {
 		c.UI.Error(fmt.Sprintf("Must specify the -id parameter"))
 		return 1
 	}
@@ -51,19 +68,41 @@ func (c *cmd) Run(args []string) int {
 		return 1
 	}
 
-	tokenID, err := acl.GetTokenIDFromPartial(client, c.tokenID)
-	if err != nil {
-		c.UI.Error(fmt.Sprintf("Error determining token ID: %v", err))
-		return 1
+	var t *api.ACLToken
+	if !c.self {
+		tokenID, err := acl.GetTokenIDFromPartial(client, c.tokenID)
+		if err != nil {
+			c.UI.Error(fmt.Sprintf("Error determining token ID: %v", err))
+			return 1
+		}
+
+		t, _, err = client.ACL().TokenRead(tokenID, nil)
+		if err != nil {
+			c.UI.Error(fmt.Sprintf("Error reading token %q: %v", tokenID, err))
+			return 1
+		}
+	} else {
+		t, _, err = client.ACL().TokenReadSelf(nil)
+		if err != nil {
+			c.UI.Error(fmt.Sprintf("Error reading token: %v", err))
+			return 1
+		}
 	}
 
-	token, _, err := client.ACL().TokenRead(tokenID, nil)
+	formatter, err := token.NewFormatter(c.format, c.showMeta)
 	if err != nil {
-		c.UI.Error(fmt.Sprintf("Error reading token %q: %v", tokenID, err))
+		c.UI.Error(err.Error())
 		return 1
 	}
+	out, err := formatter.FormatToken(t)
+	if err != nil {
+		c.UI.Error(err.Error())
+		return 1
+	}
+	if out != "" {
+		c.UI.Info(out)
+	}
 
-	acl.PrintToken(token, c.UI, true)
 	return 0
 }
 
@@ -75,7 +114,7 @@ func (c *cmd) Help() string {
 	return flags.Usage(c.help, nil)
 }
 
-const synopsis = "Read an ACL Token"
+const synopsis = "Read an ACL token"
 const help = `
 Usage: consul acl token read [options] -id TOKENID
 

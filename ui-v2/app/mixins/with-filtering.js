@@ -6,6 +6,8 @@ const toKeyValue = function(el) {
   let value = '';
   switch (el.type) {
     case 'radio':
+      value = el.value === 'on' ? '' : el.value;
+      break;
     case 'search':
     case 'text':
       value = el.value;
@@ -15,7 +17,7 @@ const toKeyValue = function(el) {
 };
 export default Mixin.create({
   filters: {},
-  filtered: computed('items', 'filters', function() {
+  filtered: computed('items.[]', 'filters', function() {
     const filters = get(this, 'filters');
     return get(this, 'items').filter(item => {
       return this.filter(item, filters);
@@ -39,7 +41,7 @@ export default Mixin.create({
         set(this, key, obj[key] != '' ? obj[key] : null);
       });
       set(this, 'filters', {
-        ...this.get('filters'),
+        ...this.filters,
         ...obj,
       });
     },

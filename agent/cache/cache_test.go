@@ -23,7 +23,7 @@ func TestCacheGet_noIndex(t *testing.T) {
 	typ := TestType(t)
 	defer typ.AssertExpectations(t)
 	c := TestCache(t)
-	c.RegisterType("t", typ, nil)
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	typ.Static(FetchResult{Value: 42}, nil).Times(1)
@@ -56,7 +56,7 @@ func TestCacheGet_initError(t *testing.T) {
 	typ := TestType(t)
 	defer typ.AssertExpectations(t)
 	c := TestCache(t)
-	c.RegisterType("t", typ, nil)
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	fetcherr := fmt.Errorf("error")
@@ -81,6 +81,67 @@ func TestCacheGet_initError(t *testing.T) {
 	typ.AssertExpectations(t)
 }
 
+// Test a cached error is replaced by a successful result. See
+// https://github.com/hashicorp/consul/issues/4480
+func TestCacheGet_cachedErrorsDontStick(t *testing.T) {
+	t.Parallel()
+
+	require := require.New(t)
+
+	typ := TestType(t)
+	defer typ.AssertExpectations(t)
+	c := TestCache(t)
+	c.RegisterType("t", typ)
+
+	// Configure the type
+	fetcherr := fmt.Errorf("initial error")
+	// First fetch errors, subsequent fetches are successful and then block
+	typ.Static(FetchResult{}, fetcherr).Times(1)
+	typ.Static(FetchResult{Value: 42, Index: 123}, nil).Times(1)
+	// We trigger this to return same value to simulate a timeout.
+	triggerCh := make(chan time.Time)
+	typ.Static(FetchResult{Value: 42, Index: 123}, nil).WaitUntil(triggerCh)
+
+	// Get, should fetch and get error
+	req := TestRequest(t, RequestInfo{Key: "hello"})
+	result, meta, err := c.Get("t", req)
+	require.Error(err)
+	require.Nil(result)
+	require.False(meta.Hit)
+
+	// Get, should fetch again since our last fetch was an error, but get success
+	result, meta, err = c.Get("t", req)
+	require.NoError(err)
+	require.Equal(42, result)
+	require.False(meta.Hit)
+
+	// Now get should block until timeout and then get the same response NOT the
+	// cached error.
+	getCh1 := TestCacheGetCh(t, c, "t", TestRequest(t, RequestInfo{
+		Key:      "hello",
+		MinIndex: 123,
+		// We _don't_ set a timeout here since that doesn't trigger the bug - the
+		// bug occurs when the Fetch call times out and returns the same value when
+		// an error is set. If it returns a new value the blocking loop works too.
+	}))
+	time.AfterFunc(50*time.Millisecond, func() {
+		// "Timeout" the Fetch after a short time.
+		close(triggerCh)
+	})
+	select {
+	case result := <-getCh1:
+		t.Fatalf("result or error returned before an update happened. "+
+			"If this is nil look above for the error log: %v", result)
+	case <-time.After(100 * time.Millisecond):
+		// It _should_ keep blocking for a new value here
+	}
+
+	// Sleep a tiny bit just to let maybe some background calls happen
+	// then verify the calls.
+	time.Sleep(20 * time.Millisecond)
+	typ.AssertExpectations(t)
+}
+
 // Test a Get with a request that returns a blank cache key. This should
 // force a backend request and skip the cache entirely.
 func TestCacheGet_blankCacheKey(t *testing.T) {
@@ -91,7 +152,7 @@ func TestCacheGet_blankCacheKey(t *testing.T) {
 	typ := TestType(t)
 	defer typ.AssertExpectations(t)
 	c := TestCache(t)
-	c.RegisterType("t", typ, nil)
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	typ.Static(FetchResult{Value: 42}, nil).Times(2)
@@ -122,7 +183,7 @@ func TestCacheGet_blockingInitSameKey(t *testing.T) {
 	typ := TestType(t)
 	defer typ.AssertExpectations(t)
 	c := TestCache(t)
-	c.RegisterType("t", typ, nil)
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	triggerCh := make(chan time.Time)
@@ -159,7 +220,7 @@ func TestCacheGet_blockingInitDiffKeys(t *testing.T) {
 	typ := TestType(t)
 	defer typ.AssertExpectations(t)
 	c := TestCache(t)
-	c.RegisterType("t", typ, nil)
+	c.RegisterType("t", typ)
 
 	// Keep track of the keys
 	var keysLock sync.Mutex
@@ -209,7 +270,7 @@ func TestCacheGet_blockingIndex(t *testing.T) {
 	typ := TestType(t)
 	defer typ.AssertExpectations(t)
 	c := TestCache(t)
-	c.RegisterType("t", typ, nil)
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	triggerCh := make(chan time.Time)
@@ -243,7 +304,7 @@ func TestCacheGet_blockingIndexTimeout(t *testing.T) {
 	typ := TestType(t)
 	defer typ.AssertExpectations(t)
 	c := TestCache(t)
-	c.RegisterType("t", typ, nil)
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	triggerCh := make(chan time.Time)
@@ -279,7 +340,7 @@ func TestCacheGet_blockingIndexError(t *testing.T) {
 	typ := TestType(t)
 	defer typ.AssertExpectations(t)
 	c := TestCache(t)
-	c.RegisterType("t", typ, nil)
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	var retries uint32
@@ -316,11 +377,19 @@ func TestCacheGet_emptyFetchResult(t *testing.T) {
 	typ := TestType(t)
 	defer typ.AssertExpectations(t)
 	c := TestCache(t)
-	c.RegisterType("t", typ, nil)
+	c.RegisterType("t", typ)
+
+	stateCh := make(chan int, 1)
 
 	// Configure the type
-	typ.Static(FetchResult{Value: 42, Index: 1}, nil).Times(1)
-	typ.Static(FetchResult{Value: nil}, nil)
+	typ.Static(FetchResult{Value: 42, State: 31, Index: 1}, nil).Times(1)
+	// Return different State, it should NOT be ignored
+	typ.Static(FetchResult{Value: nil, State: 32}, nil).Run(func(args mock.Arguments) {
+		// We should get back the original state
+		opts := args.Get(0).(FetchOptions)
+		require.NotNil(opts.LastResult)
+		stateCh <- opts.LastResult.State.(int)
+	})
 
 	// Get, should fetch
 	req := TestRequest(t, RequestInfo{Key: "hello"})
@@ -337,6 +406,29 @@ func TestCacheGet_emptyFetchResult(t *testing.T) {
 	require.Equal(42, result)
 	require.False(meta.Hit)
 
+	// State delivered to second call should be the result from first call.
+	select {
+	case state := <-stateCh:
+		require.Equal(31, state)
+	case <-time.After(20 * time.Millisecond):
+		t.Fatal("timed out")
+	}
+
+	// Next request should get the SECOND returned state even though the fetch
+	// returns nil and so the previous result is used.
+	req = TestRequest(t, RequestInfo{
+		Key: "hello", MinIndex: 1, Timeout: 100 * time.Millisecond})
+	result, meta, err = c.Get("t", req)
+	require.NoError(err)
+	require.Equal(42, result)
+	require.False(meta.Hit)
+	select {
+	case state := <-stateCh:
+		require.Equal(32, state)
+	case <-time.After(20 * time.Millisecond):
+		t.Fatal("timed out")
+	}
+
 	// Sleep a tiny bit just to let maybe some background calls happen
 	// then verify that we still only got the one call
 	time.Sleep(20 * time.Millisecond)
@@ -348,14 +440,15 @@ func TestCacheGet_emptyFetchResult(t *testing.T) {
 func TestCacheGet_periodicRefresh(t *testing.T) {
 	t.Parallel()
 
-	typ := TestType(t)
-	defer typ.AssertExpectations(t)
-	c := TestCache(t)
-	c.RegisterType("t", typ, &RegisterOptions{
+	typ := &MockType{}
+	typ.On("RegisterOptions").Return(RegisterOptions{
 		Refresh:        true,
 		RefreshTimer:   100 * time.Millisecond,
 		RefreshTimeout: 5 * time.Minute,
 	})
+	defer typ.AssertExpectations(t)
+	c := TestCache(t)
+	c.RegisterType("t", typ)
 
 	// This is a bit weird, but we do this to ensure that the final
 	// call to the Fetch (if it happens, depends on timing) just blocks.
@@ -387,14 +480,15 @@ func TestCacheGet_periodicRefresh(t *testing.T) {
 func TestCacheGet_periodicRefreshMultiple(t *testing.T) {
 	t.Parallel()
 
-	typ := TestType(t)
-	defer typ.AssertExpectations(t)
-	c := TestCache(t)
-	c.RegisterType("t", typ, &RegisterOptions{
+	typ := &MockType{}
+	typ.On("RegisterOptions").Return(RegisterOptions{
 		Refresh:        true,
 		RefreshTimer:   0 * time.Millisecond,
 		RefreshTimeout: 5 * time.Minute,
 	})
+	defer typ.AssertExpectations(t)
+	c := TestCache(t)
+	c.RegisterType("t", typ)
 
 	// This is a bit weird, but we do this to ensure that the final
 	// call to the Fetch (if it happens, depends on timing) just blocks.
@@ -435,14 +529,15 @@ func TestCacheGet_periodicRefreshMultiple(t *testing.T) {
 func TestCacheGet_periodicRefreshErrorBackoff(t *testing.T) {
 	t.Parallel()
 
-	typ := TestType(t)
-	defer typ.AssertExpectations(t)
-	c := TestCache(t)
-	c.RegisterType("t", typ, &RegisterOptions{
+	typ := &MockType{}
+	typ.On("RegisterOptions").Return(RegisterOptions{
 		Refresh:        true,
 		RefreshTimer:   0,
 		RefreshTimeout: 5 * time.Minute,
 	})
+	defer typ.AssertExpectations(t)
+	c := TestCache(t)
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	var retries uint32
@@ -476,14 +571,15 @@ func TestCacheGet_periodicRefreshErrorBackoff(t *testing.T) {
 func TestCacheGet_periodicRefreshBadRPCZeroIndexErrorBackoff(t *testing.T) {
 	t.Parallel()
 
-	typ := TestType(t)
-	defer typ.AssertExpectations(t)
-	c := TestCache(t)
-	c.RegisterType("t", typ, &RegisterOptions{
+	typ := &MockType{}
+	typ.On("RegisterOptions").Return(RegisterOptions{
 		Refresh:        true,
 		RefreshTimer:   0,
 		RefreshTimeout: 5 * time.Minute,
 	})
+	defer typ.AssertExpectations(t)
+	c := TestCache(t)
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	var retries uint32
@@ -519,14 +615,16 @@ func TestCacheGet_periodicRefreshBadRPCZeroIndexErrorBackoff(t *testing.T) {
 func TestCacheGet_noIndexSetsOne(t *testing.T) {
 	t.Parallel()
 
-	typ := TestType(t)
+	typ := &MockType{}
+	typ.On("RegisterOptions").Return(RegisterOptions{
+		SupportsBlocking: true,
+		Refresh:          true,
+		RefreshTimer:     0,
+		RefreshTimeout:   5 * time.Minute,
+	})
 	defer typ.AssertExpectations(t)
 	c := TestCache(t)
-	c.RegisterType("t", typ, &RegisterOptions{
-		Refresh:        true,
-		RefreshTimer:   0,
-		RefreshTimeout: 5 * time.Minute,
-	})
+	c.RegisterType("t", typ)
 
 	// Simulate "well behaved" RPC with no data yet but returning 1
 	{
@@ -579,15 +677,17 @@ func TestCacheGet_fetchTimeout(t *testing.T) {
 
 	require := require.New(t)
 
-	typ := TestType(t)
+	typ := &MockType{}
+	timeout := 10 * time.Minute
+	typ.On("RegisterOptions").Return(RegisterOptions{
+		RefreshTimeout:   timeout,
+		SupportsBlocking: true,
+	})
 	defer typ.AssertExpectations(t)
 	c := TestCache(t)
 
 	// Register the type with a timeout
-	timeout := 10 * time.Minute
-	c.RegisterType("t", typ, &RegisterOptions{
-		RefreshTimeout: timeout,
-	})
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	var actual time.Duration
@@ -613,14 +713,15 @@ func TestCacheGet_expire(t *testing.T) {
 
 	require := require.New(t)
 
-	typ := TestType(t)
+	typ := &MockType{}
+	typ.On("RegisterOptions").Return(RegisterOptions{
+		LastGetTTL: 400 * time.Millisecond,
+	})
 	defer typ.AssertExpectations(t)
 	c := TestCache(t)
 
 	// Register the type with a timeout
-	c.RegisterType("t", typ, &RegisterOptions{
-		LastGetTTL: 400 * time.Millisecond,
-	})
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	typ.Static(FetchResult{Value: 42}, nil).Times(2)
@@ -668,14 +769,15 @@ func TestCacheGet_expireResetGet(t *testing.T) {
 
 	require := require.New(t)
 
-	typ := TestType(t)
+	typ := &MockType{}
+	typ.On("RegisterOptions").Return(RegisterOptions{
+		LastGetTTL: 150 * time.Millisecond,
+	})
 	defer typ.AssertExpectations(t)
 	c := TestCache(t)
 
 	// Register the type with a timeout
-	c.RegisterType("t", typ, &RegisterOptions{
-		LastGetTTL: 150 * time.Millisecond,
-	})
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	typ.Static(FetchResult{Value: 42}, nil).Times(2)
@@ -729,8 +831,8 @@ func TestCacheGet_duplicateKeyDifferentType(t *testing.T) {
 	defer typ2.AssertExpectations(t)
 
 	c := TestCache(t)
-	c.RegisterType("t", typ, nil)
-	c.RegisterType("t2", typ2, nil)
+	c.RegisterType("t", typ)
+	c.RegisterType("t2", typ2)
 
 	// Configure the types
 	typ.Static(FetchResult{Value: 100}, nil)
@@ -771,7 +873,7 @@ func TestCacheGet_partitionDC(t *testing.T) {
 	t.Parallel()
 
 	c := TestCache(t)
-	c.RegisterType("t", &testPartitionType{}, nil)
+	c.RegisterType("t", &testPartitionType{})
 
 	// Perform multiple gets
 	getCh1 := TestCacheGetCh(t, c, "t", TestRequest(t, RequestInfo{
@@ -790,7 +892,7 @@ func TestCacheGet_partitionToken(t *testing.T) {
 	t.Parallel()
 
 	c := TestCache(t)
-	c.RegisterType("t", &testPartitionType{}, nil)
+	c.RegisterType("t", &testPartitionType{})
 
 	// Perform multiple gets
 	getCh1 := TestCacheGetCh(t, c, "t", TestRequest(t, RequestInfo{
@@ -815,8 +917,10 @@ func (t *testPartitionType) Fetch(opts FetchOptions, r Request) (FetchResult, er
 	}, nil
 }
 
-func (t *testPartitionType) SupportsBlocking() bool {
-	return true
+func (t *testPartitionType) RegisterOptions() RegisterOptions {
+	return RegisterOptions{
+		SupportsBlocking: true,
+	}
 }
 
 // Test that background refreshing reports correct Age in failure and happy
@@ -826,14 +930,15 @@ func TestCacheGet_refreshAge(t *testing.T) {
 
 	require := require.New(t)
 
-	typ := TestType(t)
-	defer typ.AssertExpectations(t)
-	c := TestCache(t)
-	c.RegisterType("t", typ, &RegisterOptions{
+	typ := &MockType{}
+	typ.On("RegisterOptions").Return(RegisterOptions{
 		Refresh:        true,
 		RefreshTimer:   0,
 		RefreshTimeout: 5 * time.Minute,
 	})
+	defer typ.AssertExpectations(t)
+	c := TestCache(t)
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	var index, shouldFail uint64
@@ -842,15 +947,12 @@ func TestCacheGet_refreshAge(t *testing.T) {
 		Return(func(o FetchOptions, r Request) FetchResult {
 			idx := atomic.LoadUint64(&index)
 			if atomic.LoadUint64(&shouldFail) == 1 {
-				t.Logf("Failing Fetch at index %d", idx)
 				return FetchResult{Value: nil, Index: idx}
 			}
 			if o.MinIndex == idx {
-				t.Logf("Sleeping Fetch at index %d", idx)
 				// Simulate waiting for a new value
 				time.Sleep(5 * time.Millisecond)
 			}
-			t.Logf("Returning Fetch at index %d", idx)
 			return FetchResult{Value: int(idx * 2), Index: idx}
 		}, func(o FetchOptions, r Request) error {
 			if atomic.LoadUint64(&shouldFail) == 1 {
@@ -946,13 +1048,14 @@ func TestCacheGet_nonRefreshAge(t *testing.T) {
 
 	require := require.New(t)
 
-	typ := TestType(t)
-	defer typ.AssertExpectations(t)
-	c := TestCache(t)
-	c.RegisterType("t", typ, &RegisterOptions{
+	typ := &MockType{}
+	typ.On("RegisterOptions").Return(RegisterOptions{
 		Refresh:    false,
 		LastGetTTL: 100 * time.Millisecond,
 	})
+	defer typ.AssertExpectations(t)
+	c := TestCache(t)
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	var index uint64
@@ -1031,9 +1134,8 @@ func TestCacheGet_nonBlockingType(t *testing.T) {
 	t.Parallel()
 
 	typ := TestTypeNonBlocking(t)
-	defer typ.AssertExpectations(t)
 	c := TestCache(t)
-	c.RegisterType("t", typ, nil)
+	c.RegisterType("t", typ)
 
 	// Configure the type
 	typ.Static(FetchResult{Value: 42, Index: 1}, nil).Once()

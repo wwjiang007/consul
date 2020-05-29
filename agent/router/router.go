@@ -2,14 +2,15 @@ package router
 
 import (
 	"fmt"
-	"log"
 	"sort"
 	"sync"
 
 	"github.com/hashicorp/consul/agent/metadata"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/logging"
 	"github.com/hashicorp/consul/types"
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/serf/coordinate"
 	"github.com/hashicorp/serf/serf"
 )
@@ -19,11 +20,15 @@ import (
 // healthy routes to servers by datacenter.
 type Router struct {
 	// logger is used for diagnostic output.
-	logger *log.Logger
+	logger hclog.Logger
 
 	// localDatacenter has the name of the router's home datacenter. This is
 	// used to short-circuit RTT calculations for local servers.
 	localDatacenter string
+
+	// serverName has the name of the router's server. This is used to
+	// short-circuit pinging to itself.
+	serverName string
 
 	// areas maps area IDs to structures holding information about that
 	// area.
@@ -82,10 +87,15 @@ type areaInfo struct {
 }
 
 // NewRouter returns a new Router with the given configuration.
-func NewRouter(logger *log.Logger, localDatacenter string) *Router {
+func NewRouter(logger hclog.Logger, localDatacenter, serverName string) *Router {
+	if logger == nil {
+		logger = hclog.New(&hclog.LoggerOptions{})
+	}
+
 	router := &Router{
-		logger:          logger,
+		logger:          logger.Named(logging.Router),
 		localDatacenter: localDatacenter,
+		serverName:      serverName,
 		areas:           make(map[types.AreaID]*areaInfo),
 		managers:        make(map[string][]*Manager),
 	}
@@ -115,7 +125,7 @@ func (r *Router) Shutdown() {
 }
 
 // AddArea registers a new network area with the router.
-func (r *Router) AddArea(areaID types.AreaID, cluster RouterSerfCluster, pinger Pinger, useTLS bool) error {
+func (r *Router) AddArea(areaID types.AreaID, cluster RouterSerfCluster, pinger Pinger) error {
 	r.Lock()
 	defer r.Unlock()
 
@@ -131,7 +141,6 @@ func (r *Router) AddArea(areaID types.AreaID, cluster RouterSerfCluster, pinger 
 		cluster:  cluster,
 		pinger:   pinger,
 		managers: make(map[string]*managerInfo),
-		useTLS:   useTLS,
 	}
 	r.areas[areaID] = area
 
@@ -142,8 +151,10 @@ func (r *Router) AddArea(areaID types.AreaID, cluster RouterSerfCluster, pinger 
 	for _, m := range cluster.Members() {
 		ok, parts := metadata.IsConsulServer(m)
 		if !ok {
-			r.logger.Printf("[WARN]: consul: Non-server %q in server-only area %q",
-				m.Name, areaID)
+			r.logger.Warn("Non-server in server-only area",
+				"non_server", m.Name,
+				"area", areaID,
+			)
 			continue
 		}
 
@@ -152,6 +163,23 @@ func (r *Router) AddArea(areaID types.AreaID, cluster RouterSerfCluster, pinger 
 		}
 	}
 
+	return nil
+}
+
+// GetServerMetadataByAddr returns server metadata by dc and address. If it
+// didn't find anything, nil is returned.
+func (r *Router) GetServerMetadataByAddr(dc, addr string) *metadata.Server {
+	r.RLock()
+	defer r.RUnlock()
+	if ms, ok := r.managers[dc]; ok {
+		for _, m := range ms {
+			for _, s := range m.getServerList().servers {
+				if s.Addr.String() == addr {
+					return s
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -212,7 +240,7 @@ func (r *Router) addServer(area *areaInfo, s *metadata.Server) error {
 	info, ok := area.managers[s.Datacenter]
 	if !ok {
 		shutdownCh := make(chan struct{})
-		manager := New(r.logger, shutdownCh, area.cluster, area.pinger)
+		manager := New(r.logger, shutdownCh, area.cluster, area.pinger, r.serverName)
 		info = &managerInfo{
 			manager:    manager,
 			shutdownCh: shutdownCh,
@@ -341,6 +369,28 @@ func (r *Router) findDirectRoute(datacenter string) (*Manager, *metadata.Server,
 	return nil, nil, false
 }
 
+// CheckServers returns thwo things
+// 1. bool to indicate whether any servers were processed
+// 2. error if any propagated from the fn
+//
+// The fn called should return a bool indicating whether checks should continue and an error
+// If an error is returned then checks will stop immediately
+func (r *Router) CheckServers(dc string, fn func(srv *metadata.Server) bool) {
+	r.RLock()
+	defer r.RUnlock()
+
+	managers, ok := r.managers[dc]
+	if !ok {
+		return
+	}
+
+	for _, m := range managers {
+		if !m.checkServers(fn) {
+			return
+		}
+	}
+}
+
 // GetDatacenters returns a list of datacenters known to the router, sorted by
 // name.
 func (r *Router) GetDatacenters() []string {
@@ -354,6 +404,14 @@ func (r *Router) GetDatacenters() []string {
 
 	sort.Strings(dcs)
 	return dcs
+}
+
+// HasDatacenter checks whether dc is defined in WAN
+func (r *Router) HasDatacenter(dc string) bool {
+	r.RLock()
+	defer r.RUnlock()
+	_, ok := r.managers[dc]
+	return ok
 }
 
 // datacenterSorter takes a list of DC names and a parallel vector of distances
@@ -401,8 +459,18 @@ func (r *Router) GetDatacentersByDistance() ([]string, error) {
 		for _, m := range info.cluster.Members() {
 			ok, parts := metadata.IsConsulServer(m)
 			if !ok {
-				r.logger.Printf("[WARN]: consul: Non-server %q in server-only area %q",
-					m.Name, areaID)
+				r.logger.Warn("Non-server in server-only area",
+					"non_server", m.Name,
+					"area", areaID,
+				)
+				continue
+			}
+
+			if m.Status == serf.StatusLeft {
+				r.logger.Debug("server in area left, skipping",
+					"server", m.Name,
+					"area", areaID,
+				)
 				continue
 			}
 
@@ -462,8 +530,18 @@ func (r *Router) GetDatacenterMaps() ([]structs.DatacenterMap, error) {
 		for _, m := range info.cluster.Members() {
 			ok, parts := metadata.IsConsulServer(m)
 			if !ok {
-				r.logger.Printf("[WARN]: consul: Non-server %q in server-only area %q",
-					m.Name, areaID)
+				r.logger.Warn("Non-server in server-only area",
+					"non_server", m.Name,
+					"area", areaID,
+				)
+				continue
+			}
+
+			if m.Status == serf.StatusLeft {
+				r.logger.Debug("server in area left, skipping",
+					"server", m.Name,
+					"area", areaID,
+				)
 				continue
 			}
 

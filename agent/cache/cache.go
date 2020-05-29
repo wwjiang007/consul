@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
+	"github.com/hashicorp/consul/lib"
 )
 
 //go:generate mockery -all -inpkg
@@ -82,6 +83,8 @@ type Cache struct {
 
 // typeEntry is a single type that is registered with a Cache.
 type typeEntry struct {
+	// Name that was used to register the Type
+	Name string
 	Type Type
 	Opts *RegisterOptions
 }
@@ -157,6 +160,12 @@ type RegisterOptions struct {
 	// is to only request data on explicit Get.
 	Refresh bool
 
+	// SupportsBlocking should be set to true if the type supports blocking queries.
+	// Types that do not support blocking queries will not be able to use
+	// background refresh nor will the cache attempt blocking fetches if the
+	// client requests them with MinIndex.
+	SupportsBlocking bool
+
 	// RefreshTimer is the time between attempting to refresh data.
 	// If this is zero, then data is refreshed immediately when a fetch
 	// is returned.
@@ -182,17 +191,15 @@ type RegisterOptions struct {
 //
 // This makes the type available for Get but does not automatically perform
 // any prefetching. In order to populate the cache, Get must be called.
-func (c *Cache) RegisterType(n string, typ Type, opts *RegisterOptions) {
-	if opts == nil {
-		opts = &RegisterOptions{}
-	}
+func (c *Cache) RegisterType(n string, typ Type) {
+	opts := typ.RegisterOptions()
 	if opts.LastGetTTL == 0 {
 		opts.LastGetTTL = 72 * time.Hour // reasonable default is days
 	}
 
 	c.typesLock.Lock()
 	defer c.typesLock.Unlock()
-	c.types[n] = typeEntry{Type: typ, Opts: opts}
+	c.types[n] = typeEntry{Name: n, Type: typ, Opts: &opts}
 }
 
 // Get loads the data for the given type and request. If data satisfying the
@@ -210,33 +217,6 @@ func (c *Cache) RegisterType(n string, typ Type, opts *RegisterOptions) {
 // error is returned on timeout. This matches the behavior of Consul blocking
 // queries.
 func (c *Cache) Get(t string, r Request) (interface{}, ResultMeta, error) {
-	return c.getWithIndex(t, r, r.CacheInfo().MinIndex)
-}
-
-// getWithIndex implements the main Get functionality but allows internal
-// callers (Watch) to manipulate the blocking index separately from the actual
-// request object.
-func (c *Cache) getWithIndex(t string, r Request, minIndex uint64) (interface{}, ResultMeta, error) {
-	info := r.CacheInfo()
-	if info.Key == "" {
-		metrics.IncrCounter([]string{"consul", "cache", "bypass"}, 1)
-
-		// If no key is specified, then we do not cache this request.
-		// Pass directly through to the backend.
-		return c.fetchDirect(t, r, minIndex)
-	}
-
-	// Get the actual key for our entry
-	key := c.entryKey(t, &info)
-
-	// First time through
-	first := true
-
-	// timeoutCh for watching our timeout
-	var timeoutCh <-chan time.Time
-
-RETRY_GET:
-	// Get the type that we're fetching
 	c.typesLock.RLock()
 	tEntry, ok := c.types[t]
 	c.typesLock.RUnlock()
@@ -245,49 +225,107 @@ RETRY_GET:
 		// once. But be robust against panics.
 		return nil, ResultMeta{}, fmt.Errorf("unknown type in cache: %s", t)
 	}
+	return c.getWithIndex(newGetOptions(tEntry, r))
+}
 
-	// Get the current value
-	c.entriesLock.RLock()
+// getOptions contains the arguments for a Get request. It is used in place of
+// Request so that internal functions can modify Info without having to extract
+// it from the Request each time.
+type getOptions struct {
+	// Fetch is a closure over tEntry.Type.Fetch which provides the original
+	// Request from the caller.
+	Fetch     func(opts FetchOptions) (FetchResult, error)
+	Info      RequestInfo
+	TypeEntry typeEntry
+}
+
+func newGetOptions(tEntry typeEntry, r Request) getOptions {
+	return getOptions{
+		Fetch: func(opts FetchOptions) (FetchResult, error) {
+			return tEntry.Type.Fetch(opts, r)
+		},
+		Info:      r.CacheInfo(),
+		TypeEntry: tEntry,
+	}
+}
+
+// getEntryLocked retrieves a cache entry and checks if it is ready to be
+// returned given the other parameters. It reads from entries and the caller
+// has to issue a read lock if necessary.
+func (c *Cache) getEntryLocked(
+	tEntry typeEntry,
+	key string,
+	info RequestInfo,
+) (entryExists bool, entryValid bool, entry cacheEntry) {
 	entry, ok := c.entries[key]
-	c.entriesLock.RUnlock()
-
-	// Check if we have a hit
-	cacheHit := ok && entry.Valid
-
-	supportsBlocking := tEntry.Type.SupportsBlocking()
+	if !entry.Valid {
+		return ok, false, entry
+	}
 
 	// Check index is not specified or lower than value, or the type doesn't
 	// support blocking.
-	if cacheHit && supportsBlocking &&
-		minIndex > 0 && minIndex >= entry.Index {
+	if tEntry.Opts.SupportsBlocking && info.MinIndex > 0 && info.MinIndex >= entry.Index {
 		// MinIndex was given and matches or is higher than current value so we
 		// ignore the cache and fallthrough to blocking on a new value below.
-		cacheHit = false
+		return true, false, entry
 	}
 
 	// Check MaxAge is not exceeded if this is not a background refreshing type
 	// and MaxAge was specified.
-	if cacheHit && !tEntry.Opts.Refresh && info.MaxAge > 0 &&
-		!entry.FetchedAt.IsZero() && info.MaxAge < time.Since(entry.FetchedAt) {
-		cacheHit = false
+	if !tEntry.Opts.Refresh && info.MaxAge > 0 && entryExceedsMaxAge(info.MaxAge, entry) {
+		return true, false, entry
 	}
 
-	// Check if we are requested to revalidate. If so the first time round the
+	// Check if re-validate is requested. If so the first time round the
 	// loop is not a hit but subsequent ones should be treated normally.
-	if cacheHit && !tEntry.Opts.Refresh && info.MustRevalidate && first {
-		cacheHit = false
+	if !tEntry.Opts.Refresh && info.MustRevalidate {
+		return true, false, entry
 	}
 
-	if cacheHit {
+	return true, true, entry
+}
+
+func entryExceedsMaxAge(maxAge time.Duration, entry cacheEntry) bool {
+	return !entry.FetchedAt.IsZero() && maxAge < time.Since(entry.FetchedAt)
+}
+
+// getWithIndex implements the main Get functionality but allows internal
+// callers (Watch) to manipulate the blocking index separately from the actual
+// request object.
+func (c *Cache) getWithIndex(r getOptions) (interface{}, ResultMeta, error) {
+	if r.Info.Key == "" {
+		metrics.IncrCounter([]string{"consul", "cache", "bypass"}, 1)
+
+		// If no key is specified, then we do not cache this request.
+		// Pass directly through to the backend.
+		result, err := r.Fetch(FetchOptions{MinIndex: r.Info.MinIndex})
+		return result.Value, ResultMeta{}, err
+	}
+
+	key := makeEntryKey(r.TypeEntry.Name, r.Info.Datacenter, r.Info.Token, r.Info.Key)
+
+	// First time through
+	first := true
+
+	// timeoutCh for watching our timeout
+	var timeoutCh <-chan time.Time
+
+RETRY_GET:
+	// Get the current value
+	c.entriesLock.RLock()
+	_, entryValid, entry := c.getEntryLocked(r.TypeEntry, key, r.Info)
+	c.entriesLock.RUnlock()
+
+	if entryValid {
 		meta := ResultMeta{Index: entry.Index}
 		if first {
-			metrics.IncrCounter([]string{"consul", "cache", t, "hit"}, 1)
+			metrics.IncrCounter([]string{"consul", "cache", r.TypeEntry.Name, "hit"}, 1)
 			meta.Hit = true
 		}
 
 		// If refresh is enabled, calculate age based on whether the background
 		// routine is still connected.
-		if tEntry.Opts.Refresh {
+		if r.TypeEntry.Opts.Refresh {
 			meta.Age = time.Duration(0)
 			if !entry.RefreshLostContact.IsZero() {
 				meta.Age = time.Since(entry.RefreshLostContact)
@@ -302,22 +340,32 @@ RETRY_GET:
 
 		// Touch the expiration and fix the heap.
 		c.entriesLock.Lock()
-		entry.Expiry.Reset()
+		entry.Expiry.Update(r.TypeEntry.Opts.LastGetTTL)
 		c.entriesExpiryHeap.Fix(entry.Expiry)
 		c.entriesLock.Unlock()
 
-		// We purposely do not return an error here since the cache
-		// only works with fetching values that either have a value
-		// or have an error, but not both. The Error may be non-nil
-		// in the entry because of this to note future fetch errors.
+		// We purposely do not return an error here since the cache only works with
+		// fetching values that either have a value or have an error, but not both.
+		// The Error may be non-nil in the entry in the case that an error has
+		// occurred _since_ the last good value, but we still want to return the
+		// good value to clients that are not requesting a specific version. The
+		// effect of this is that blocking clients will all see an error immediately
+		// without waiting a whole timeout to see it, but clients that just look up
+		// cache with an older index than the last valid result will still see the
+		// result and not the error here. I.e. the error is not "cached" without a
+		// new fetch attempt occurring, but the last good value can still be fetched
+		// from cache.
 		return entry.Value, meta, nil
 	}
 
-	// If this isn't our first time through and our last value has an error,
-	// then we return the error. This has the behavior that we don't sit in
-	// a retry loop getting the same error for the entire duration of the
-	// timeout. Instead, we make one effort to fetch a new value, and if
-	// there was an error, we return.
+	// If this isn't our first time through and our last value has an error, then
+	// we return the error. This has the behavior that we don't sit in a retry
+	// loop getting the same error for the entire duration of the timeout.
+	// Instead, we make one effort to fetch a new value, and if there was an
+	// error, we return. Note that the invariant is that if both entry.Value AND
+	// entry.Error are non-nil, the error _must_ be more recent than the Value. In
+	// other words valid fetches should reset the error. See
+	// https://github.com/hashicorp/consul/issues/4480.
 	if !first && entry.Error != nil {
 		return entry.Value, ResultMeta{Index: entry.Index}, entry.Error
 	}
@@ -326,31 +374,29 @@ RETRY_GET:
 		// We increment two different counters for cache misses depending on
 		// whether we're missing because we didn't have the data at all,
 		// or if we're missing because we're blocking on a set index.
-		if minIndex == 0 {
-			metrics.IncrCounter([]string{"consul", "cache", t, "miss_new"}, 1)
-		} else {
-			metrics.IncrCounter([]string{"consul", "cache", t, "miss_block"}, 1)
+		missKey := "miss_block"
+		if r.Info.MinIndex == 0 {
+			missKey = "miss_new"
 		}
+		metrics.IncrCounter([]string{"consul", "cache", r.TypeEntry.Name, missKey}, 1)
 	}
 
-	// No longer our first time through
-	first = false
-
 	// Set our timeout channel if we must
-	if info.Timeout > 0 && timeoutCh == nil {
-		timeoutCh = time.After(info.Timeout)
+	if r.Info.Timeout > 0 && timeoutCh == nil {
+		timeoutCh = time.After(r.Info.Timeout)
 	}
 
 	// At this point, we know we either don't have a value at all or the
 	// value we have is too old. We need to wait for new data.
-	waiterCh, err := c.fetch(t, key, r, true, 0)
-	if err != nil {
-		return nil, ResultMeta{Index: entry.Index}, err
-	}
+	waiterCh := c.fetch(key, r, true, 0, false)
+
+	// No longer our first time through
+	first = false
 
 	select {
 	case <-waiterCh:
 		// Our fetch returned, retry the get from the cache.
+		r.Info.MustRevalidate = false
 		goto RETRY_GET
 
 	case <-timeoutCh:
@@ -359,10 +405,8 @@ RETRY_GET:
 	}
 }
 
-// entryKey returns the key for the entry in the cache. See the note
-// about the entry key format in the structure docs for Cache.
-func (c *Cache) entryKey(t string, r *RequestInfo) string {
-	return fmt.Sprintf("%s/%s/%s/%s", t, r.Datacenter, r.Token, r.Key)
+func makeEntryKey(t, dc, token, key string) string {
+	return fmt.Sprintf("%s/%s/%s/%s", t, dc, token, key)
 }
 
 // fetch triggers a new background fetch for the given Request. If a
@@ -373,19 +417,19 @@ func (c *Cache) entryKey(t string, r *RequestInfo) string {
 // If allowNew is true then the fetch should create the cache entry
 // if it doesn't exist. If this is false, then fetch will do nothing
 // if the entry doesn't exist. This latter case is to support refreshing.
-func (c *Cache) fetch(t, key string, r Request, allowNew bool, attempt uint) (<-chan struct{}, error) {
-	// Get the type that we're fetching
-	c.typesLock.RLock()
-	tEntry, ok := c.types[t]
-	c.typesLock.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("unknown type in cache: %s", t)
-	}
-
+func (c *Cache) fetch(key string, r getOptions, allowNew bool, attempt uint, ignoreExisting bool) <-chan struct{} {
 	// We acquire a write lock because we may have to set Fetching to true.
 	c.entriesLock.Lock()
 	defer c.entriesLock.Unlock()
-	entry, ok := c.entries[key]
+	ok, entryValid, entry := c.getEntryLocked(r.TypeEntry, key, r.Info)
+
+	// This handles the case where a fetch succeeded after checking for its existence in
+	// getWithIndex. This ensures that we don't miss updates.
+	if ok && entryValid && !ignoreExisting {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
 
 	// If we aren't allowing new values and we don't have an existing value,
 	// return immediately. We return an immediately-closed channel so nothing
@@ -393,13 +437,13 @@ func (c *Cache) fetch(t, key string, r Request, allowNew bool, attempt uint) (<-
 	if !ok && !allowNew {
 		ch := make(chan struct{})
 		close(ch)
-		return ch, nil
+		return ch
 	}
 
 	// If we already have an entry and it is actively fetching, then return
 	// the currently active waiter.
 	if ok && entry.Fetching {
-		return entry.Waiter, nil
+		return entry.Waiter
 	}
 
 	// If we don't have an entry, then create it. The entry must be marked
@@ -415,6 +459,7 @@ func (c *Cache) fetch(t, key string, r Request, allowNew bool, attempt uint) (<-
 	c.entries[key] = entry
 	metrics.SetGauge([]string{"consul", "cache", "entries_count"}, float32(len(c.entries)))
 
+	tEntry := r.TypeEntry
 	// The actual Fetch must be performed in a goroutine.
 	go func() {
 		// If we have background refresh and currently are in "disconnected" state,
@@ -440,13 +485,20 @@ func (c *Cache) fetch(t, key string, r Request, allowNew bool, attempt uint) (<-
 		}
 
 		fOpts := FetchOptions{}
-		if tEntry.Type.SupportsBlocking() {
+		if tEntry.Opts.SupportsBlocking {
 			fOpts.MinIndex = entry.Index
 			fOpts.Timeout = tEntry.Opts.RefreshTimeout
 		}
+		if entry.Valid {
+			fOpts.LastResult = &FetchResult{
+				Value: entry.Value,
+				State: entry.State,
+				Index: entry.Index,
+			}
+		}
 
 		// Start building the new entry by blocking on the fetch.
-		result, err := tEntry.Type.Fetch(fOpts, r)
+		result, err := r.Fetch(fOpts)
 		if connectedTimer != nil {
 			connectedTimer.Stop()
 		}
@@ -454,9 +506,19 @@ func (c *Cache) fetch(t, key string, r Request, allowNew bool, attempt uint) (<-
 		// Copy the existing entry to start.
 		newEntry := entry
 		newEntry.Fetching = false
+
+		// Importantly, always reset the Error. Having both Error and a Value that
+		// are non-nil is allowed in the cache entry but it indicates that the Error
+		// is _newer_ than the last good value. So if the err is nil then we need to
+		// reset to replace any _older_ errors and avoid them bubbling up. If the
+		// error is non-nil then we need to set it anyway and used to do it in the
+		// code below. See https://github.com/hashicorp/consul/issues/4480.
+		newEntry.Error = err
+
 		if result.Value != nil {
 			// A new value was given, so we create a brand new entry.
 			newEntry.Value = result.Value
+			newEntry.State = result.State
 			newEntry.Index = result.Index
 			newEntry.FetchedAt = time.Now()
 			if newEntry.Index < 1 {
@@ -473,12 +535,21 @@ func (c *Cache) fetch(t, key string, r Request, allowNew bool, attempt uint) (<-
 
 			// This is a valid entry with a result
 			newEntry.Valid = true
+		} else if result.State != nil && err == nil {
+			// Also set state if it's non-nil but Value is nil. This is important in the
+			// case we are returning nil due to a timeout or a transient error like rate
+			// limiting that we want to mask from the user - there is no result yet but
+			// we want to manage retrying internally before we return an error to user.
+			// The retrying state is in State so we need to still update that in the
+			// entry even if we don't have an actual result yet (e.g. hit a rate limit
+			// on first request for a leaf certificate).
+			newEntry.State = result.State
 		}
 
 		// Error handling
 		if err == nil {
 			metrics.IncrCounter([]string{"consul", "cache", "fetch_success"}, 1)
-			metrics.IncrCounter([]string{"consul", "cache", t, "fetch_success"}, 1)
+			metrics.IncrCounter([]string{"consul", "cache", tEntry.Name, "fetch_success"}, 1)
 
 			if result.Index > 0 {
 				// Reset the attempts counter so we don't have any backoff
@@ -507,17 +578,10 @@ func (c *Cache) fetch(t, key string, r Request, allowNew bool, attempt uint) (<-
 			}
 		} else {
 			metrics.IncrCounter([]string{"consul", "cache", "fetch_error"}, 1)
-			metrics.IncrCounter([]string{"consul", "cache", t, "fetch_error"}, 1)
+			metrics.IncrCounter([]string{"consul", "cache", tEntry.Name, "fetch_error"}, 1)
 
 			// Increment attempt counter
 			attempt++
-
-			// Always set the error. We don't override the value here because
-			// if Valid is true, then we can reuse the Value in the case a
-			// specific index isn't requested. However, for blocking queries,
-			// we want Error to be set so that we can return early with the
-			// error.
-			newEntry.Error = err
 
 			// If we are refreshing and just failed, updated the lost contact time as
 			// our cache will be stale until we get successfully reconnected. We only
@@ -538,11 +602,8 @@ func (c *Cache) fetch(t, key string, r Request, allowNew bool, attempt uint) (<-
 		// initial expiry information and insert. If we're already in
 		// the heap we do nothing since we're reusing the same entry.
 		if newEntry.Expiry == nil || newEntry.Expiry.HeapIndex == -1 {
-			newEntry.Expiry = &cacheEntryExpiry{
-				Key: key,
-				TTL: tEntry.Opts.LastGetTTL,
-			}
-			newEntry.Expiry.Reset()
+			newEntry.Expiry = &cacheEntryExpiry{Key: key}
+			newEntry.Expiry.Update(tEntry.Opts.LastGetTTL)
 			heap.Push(c.entriesExpiryHeap, newEntry.Expiry)
 		}
 
@@ -555,35 +616,31 @@ func (c *Cache) fetch(t, key string, r Request, allowNew bool, attempt uint) (<-
 		// If refresh is enabled, run the refresh in due time. The refresh
 		// below might block, but saves us from spawning another goroutine.
 		if tEntry.Opts.Refresh {
-			c.refresh(tEntry.Opts, attempt, t, key, r)
+			// Check if cache was stopped
+			if atomic.LoadUint32(&c.stopped) == 1 {
+				return
+			}
+
+			// If we're over the attempt minimum, start an exponential backoff.
+			if wait := backOffWait(attempt); wait > 0 {
+				time.Sleep(wait)
+			}
+
+			// If we have a timer, wait for it
+			if tEntry.Opts.RefreshTimer > 0 {
+				time.Sleep(tEntry.Opts.RefreshTimer)
+			}
+
+			// Trigger. The "allowNew" field is false because in the time we were
+			// waiting to refresh we may have expired and got evicted. If that
+			// happened, we don't want to create a new entry.
+			r.Info.MustRevalidate = false
+			r.Info.MinIndex = 0
+			c.fetch(key, r, false, attempt, true)
 		}
 	}()
 
-	return entry.Waiter, nil
-}
-
-// fetchDirect fetches the given request with no caching. Because this
-// bypasses the caching entirely, multiple matching requests will result
-// in multiple actual RPC calls (unlike fetch).
-func (c *Cache) fetchDirect(t string, r Request, minIndex uint64) (interface{}, ResultMeta, error) {
-	// Get the type that we're fetching
-	c.typesLock.RLock()
-	tEntry, ok := c.types[t]
-	c.typesLock.RUnlock()
-	if !ok {
-		return nil, ResultMeta{}, fmt.Errorf("unknown type in cache: %s", t)
-	}
-
-	// Fetch it with the min index specified directly by the request.
-	result, err := tEntry.Type.Fetch(FetchOptions{
-		MinIndex: minIndex,
-	}, r)
-	if err != nil {
-		return nil, ResultMeta{}, err
-	}
-
-	// Return the result and ignore the rest
-	return result.Value, ResultMeta{}, nil
+	return entry.Waiter
 }
 
 func backOffWait(failures uint) time.Duration {
@@ -596,37 +653,9 @@ func backOffWait(failures uint) time.Duration {
 		if waitTime > CacheRefreshMaxWait {
 			waitTime = CacheRefreshMaxWait
 		}
-		return waitTime
+		return waitTime + lib.RandomStagger(waitTime)
 	}
 	return 0
-}
-
-// refresh triggers a fetch for a specific Request according to the
-// registration options.
-func (c *Cache) refresh(opts *RegisterOptions, attempt uint, t string, key string, r Request) {
-	// Sanity-check, we should not schedule anything that has refresh disabled
-	if !opts.Refresh {
-		return
-	}
-	// Check if cache was stopped
-	if atomic.LoadUint32(&c.stopped) == 1 {
-		return
-	}
-
-	// If we're over the attempt minimum, start an exponential backoff.
-	if wait := backOffWait(attempt); wait > 0 {
-		time.Sleep(wait)
-	}
-
-	// If we have a timer, wait for it
-	if opts.RefreshTimer > 0 {
-		time.Sleep(opts.RefreshTimer)
-	}
-
-	// Trigger. The "allowNew" field is false because in the time we were
-	// waiting to refresh we may have expired and got evicted. If that
-	// happened, we don't want to create a new entry.
-	c.fetch(t, key, r, false, attempt)
 }
 
 // runExpiryLoop is a blocking function that watches the expiration
@@ -645,7 +674,7 @@ func (c *Cache) runExpiryLoop() {
 		c.entriesLock.RLock()
 		if len(c.entriesExpiryHeap.Entries) > 0 {
 			entry = c.entriesExpiryHeap.Entries[0]
-			expiryTimer = time.NewTimer(entry.Expires.Sub(time.Now()))
+			expiryTimer = time.NewTimer(time.Until(entry.Expires))
 			expiryCh = expiryTimer.C
 		}
 		c.entriesLock.RUnlock()
@@ -689,5 +718,27 @@ func (c *Cache) Close() error {
 		// First time only, close stop chan
 		close(c.stopCh)
 	}
+	return nil
+}
+
+// Prepopulate puts something in the cache manually. This is useful when the
+// correct initial value is know and the cache shouldn't refetch the same thing
+// on startup. It is used to set the ConnectRootCA and AgentLeafCert when
+// AutoEncrypt.TLS is turned on. The cache itself cannot fetch that the first
+// time because it requires a special RPCType. Subsequent runs are fine though.
+func (c *Cache) Prepopulate(t string, res FetchResult, dc, token, k string) error {
+	key := makeEntryKey(t, dc, token, k)
+	newEntry := cacheEntry{
+		Valid:     true,
+		Value:     res.Value,
+		State:     res.State,
+		Index:     res.Index,
+		FetchedAt: time.Now(),
+		Waiter:    make(chan struct{}),
+		Expiry:    &cacheEntryExpiry{Key: key},
+	}
+	c.entriesLock.Lock()
+	c.entries[key] = newEntry
+	c.entriesLock.Unlock()
 	return nil
 }

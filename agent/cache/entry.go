@@ -12,6 +12,13 @@ import (
 type cacheEntry struct {
 	// Fields pertaining to the actual value
 	Value interface{}
+	// State can be used to store info needed by the cache type but that should
+	// not be part of the result the client gets. For example the Connect Leaf
+	// type needs to store additional data about when it last attempted a renewal
+	// that is not part of the actual IssuedCert struct it returns. It's opaque to
+	// the Cache but allows types to store additional data that is coupled to the
+	// cache entry's lifetime and will be aged out by TTL etc.
+	State interface{}
 	Error error
 	Index uint64
 
@@ -40,19 +47,18 @@ type cacheEntry struct {
 // entry. Any modifications to this struct should be done only while
 // the Cache entriesLock is held.
 type cacheEntryExpiry struct {
-	Key       string        // Key in the cache map
-	Expires   time.Time     // Time when entry expires (monotonic clock)
-	TTL       time.Duration // TTL for this entry to extend when resetting
-	HeapIndex int           // Index in the heap
+	Key       string    // Key in the cache map
+	Expires   time.Time // Time when entry expires (monotonic clock)
+	HeapIndex int       // Index in the heap
 }
 
-// Reset resets the expiration to be the ttl duration from now.
-func (e *cacheEntryExpiry) Reset() {
-	e.Expires = time.Now().Add(e.TTL)
+// Update the expiry to d time from now.
+func (e *cacheEntryExpiry) Update(d time.Duration) {
+	e.Expires = time.Now().Add(d)
 }
 
 // expiryHeap is a heap implementation that stores information about
-// when entires expire. Implements container/heap.Interface.
+// when entries expire. Implements container/heap.Interface.
 //
 // All operations on the heap and read/write of the heap contents require
 // the proper entriesLock to be held on Cache.
